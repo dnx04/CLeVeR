@@ -2,7 +2,7 @@
 #
 # ljy@20250707
 #
-uv run python ../clever.py \
+uv run python clever.py \
     --output_dir=saved_models \
     --pretrain_text_model_name=pretrain_text_model \
     --pretrain_code_model_name=pretrain_code_model \
