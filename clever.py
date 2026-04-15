@@ -8,6 +8,8 @@ import os
 import random
 import numpy as np
 import torch
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
 from transformers import (get_linear_schedule_with_warmup,
                           RobertaTokenizer)
@@ -30,12 +32,14 @@ def set_seed(args):
 def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
     # Build dataloader
     train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
-    
-    args.max_steps=args.epochs*len(train_dataloader)
-    args.save_steps=len(train_dataloader)//10
-    #args.save_steps = 1
-    args.warmup_steps=args.max_steps//5
+    train_dataloader = DataLoader(
+        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
+        num_workers=8, pin_memory=True
+    )
+
+    args.max_steps = args.epochs * len(train_dataloader)
+    args.save_steps = len(train_dataloader)  # eval once per epoch instead of 10x
+    args.warmup_steps = args.max_steps // 5
     model.to(args.device)
     
     # Prepare optimizer and schedule (linear warmup and decay)
@@ -48,6 +52,9 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
                                                 num_training_steps=args.max_steps)
+
+    # Mixed precision training
+    scaler = GradScaler(device="cuda")
 
     # Multi-gpu training
     if args.n_gpu > 1:
@@ -76,16 +83,18 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
             (func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
              source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask) = [x.to(args.device) for x in batch]
             model.train()
-            loss = model(func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
-                         source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask, "train")
+            with autocast(device_type='cuda'):
+                loss = model(func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
+                             source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask, "train")
 
             if args.n_gpu > 1:
                 loss = loss.mean()
-                
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
@@ -96,9 +105,10 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
             bar.set_description("epoch {} loss {}".format(idx,avg_loss))
               
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
-                scheduler.step()  
+                scheduler.step()
                 global_step += 1
 
                 if global_step % args.save_steps == 0:
@@ -136,7 +146,7 @@ def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     # Build dataloader
     eval_dataset = DetectionTestData(code_tokenizer, text_tokenizer, args, flag='val')
     eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=12, pin_memory=True)
 
     # Multi-gpu evaluate
     if args.n_gpu > 1 and eval_when_training is False:
@@ -198,7 +208,7 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False):
     # Build dataloader
     test_dataset = DetectionTestData(code_tokenizer, text_tokenizer, args, flag='test')
     test_sampler = SequentialSampler(test_dataset)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=8, pin_memory=True)
 
     # Multi-gpu evaluate
     if args.n_gpu > 1 and eval_when_training is False:
@@ -262,7 +272,7 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     # Build dataloader
     test_dataset = ClassificationTestData(code_tokenizer, text_tokenizer, args, flag='test')
     test_sampler = SequentialSampler(test_dataset)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=8, pin_memory=True)
 
     # Multi-gpu evaluate
     if args.n_gpu > 1 and eval_when_training is False:
@@ -328,7 +338,7 @@ def predict(args, model, code_tokenizer, text_tokenizer, best_threshold=0.0):
     # Build dataloader
     pred_dataset = DetectionTestData(code_tokenizer, text_tokenizer, args, flag='test')
     pred_sampler = SequentialSampler(pred_dataset)
-    pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.eval_batch_size, num_workers=8, pin_memory=True)
 
     # Multi-gpu evaluate
     if args.n_gpu > 1:
