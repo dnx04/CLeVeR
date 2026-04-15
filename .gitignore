@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Data files
+dataset/*.jsonl
+dataset/data/
+preprocessed_data/
+
+# Saved models
+saved_models/
+pretrain_vul_model/
+new_code_model/
+new_text_model/
+probe_*/
+
+# HuggingFace cached models
+pretrain_code_model/
+pretrain_text_model/
+
+# Logs
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
