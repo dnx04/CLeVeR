@@ -1,11 +1,12 @@
 #!/bin/bash
 #
-# ljy@20250707
+# Step 1 — Data preprocessing: raw JSONL -> stratified train/val/test splits.
+# Outputs to dataset/<dataset_name>/.
 #
-uv run python data_preprocess.py \
-    --pretrain_text_model_name=pretrain_text_model \
-    --pretrain_code_model_name=pretrain_code_model \
-    --program_language=c \
+set -e
+cd "$(dirname "$0")/.."
+
+PYTHONPATH=src:$PYTHONPATH uv run python src/data_preprocess.py \
     --dataset=dataset/vcldata.jsonl \
     --dataset_name=vcldata \
     --seed 220703

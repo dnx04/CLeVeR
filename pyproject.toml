@@ -12,6 +12,9 @@ dependencies = [
     "numpy>=2.0.0",
 ]
 
+[tool.pylance]
+python.analysis.extraPaths = ["src"]
+
 [tool.uv]
 index-url = "https://pypi.org/simple"
 extra-index-url = ["https://download.pytorch.org/whl/cu126"]

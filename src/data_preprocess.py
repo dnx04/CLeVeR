@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import Dataset
 import logging
 from tqdm import tqdm
 import json
@@ -8,21 +8,17 @@ import torch
 import pickle
 from generate_example import generate_description
 import argparse
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
+from sklearn.model_selection import train_test_split
 
 
 logger = logging.getLogger(__name__)
 
 class Preprocess(Dataset):
     def __init__(self, args, file_path=''):
-        self.train_examples = []
-        self.test_examples = []
         self.examples = []
-        self.split_ratio = 0.8
         dataset_file = file_path
 
         dataset = []
-        # [idx], func, name, label, cwe_id, source, sink, [description]
         idx = 0
         with open(dataset_file) as f:
             for line in f:
@@ -34,21 +30,49 @@ class Preprocess(Dataset):
 
         random.shuffle(dataset)
 
-        train_size = int(len(dataset) * self.split_ratio)
-        train_data = dataset[:train_size]
+        # Split: 80% pre-train, 20% downstream
+        # Downstream 20% split: fine-tune 70%, val 10%, test 20%
+        labels = [x.get('label', '0') for x in dataset]
+
+        pretrain_data, downstream_data = train_test_split(
+            dataset, test_size=0.2, stratify=labels, random_state=args.seed
+        )
+
+        downstream_labels = [x.get('label', '0') for x in downstream_data]
+        train_data, test_data = train_test_split(
+            downstream_data, test_size=0.2, stratify=downstream_labels, random_state=args.seed
+        )
+        train_labels = [x.get('label', '0') for x in train_data]
+        train_data, val_data = train_test_split(
+            train_data, test_size=0.125, stratify=train_labels, random_state=args.seed
+        )  # 0.125 of 80% = 10% of total
+
+        print("pretrain_data: ", len(pretrain_data))
         print("train_data: ", len(train_data))
-        test_data = dataset[train_size:]
+        print("val_data: ", len(val_data))
         print("test_data: ", len(test_data))
 
+        self.pretrain_examples = [generate_description(x) for x in tqdm(pretrain_data, total=len(pretrain_data))]
+        with open('dataset/' + args.dataset_name + '/' + args.dataset_name + '_pretrain.pkl', 'wb') as f:
+            pickle.dump(self.pretrain_examples, f)
+        print("pretrain_examples: ", len(self.pretrain_examples))
+
         self.train_examples = [generate_description(x) for x in tqdm(train_data, total=len(train_data))]
-        with open('preprocessed_data/' + args.dataset_name + '_train.pkl', 'wb') as f:
+        with open('dataset/' + args.dataset_name + '/' + args.dataset_name + '_train.pkl', 'wb') as f:
             pickle.dump(self.train_examples, f)
         print("train_examples: ", len(self.train_examples))
 
+        self.val_examples = [generate_description(x) for x in tqdm(val_data, total=len(val_data))]
+        with open('dataset/' + args.dataset_name + '/' + args.dataset_name + '_val.pkl', 'wb') as f:
+            pickle.dump(self.val_examples, f)
+        print("val_examples: ", len(self.val_examples))
+
         self.test_examples = [generate_description(x) for x in tqdm(test_data, total=len(test_data))]
-        with open('preprocessed_data/' + args.dataset_name + '_test.pkl', 'wb') as f:
+        with open('dataset/' + args.dataset_name + '/' + args.dataset_name + '_test.pkl', 'wb') as f:
             pickle.dump(self.test_examples, f)
         print("test_examples: ", len(self.test_examples))
+
+        self.examples = self.pretrain_examples  # for __len__ compatibility
 
         for idx, example in enumerate(self.examples[:2]):
             logger.info("*** Example ***")

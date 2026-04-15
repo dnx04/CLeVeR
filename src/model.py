@@ -83,6 +83,8 @@ class CodeAdapter(nn.Module):
 
 
 class CodeEncoder(nn.Module):
+    encoder: RobertaModel
+
     def __init__(self, args):
         super(CodeEncoder, self).__init__()
         self.encoder = RobertaModel.from_pretrained(args.pretrain_code_model_name)
@@ -95,27 +97,24 @@ class CodeEncoder(nn.Module):
         code_hidden_states = outputs.last_hidden_state
         cls = code_hidden_states[:, 0, :]  # return representation of CLS token
         cls = self.code_adapter(cls)
-        if flag == "train":
-            code_refined_representation = self.cross_attention(des_query, code_hidden_states, code_hidden_states)
-        else:
-            code_refined_representation = None
+        lambda_1 = 0.2
 
         if flag == "train":
+            code_refined_representation = self.cross_attention(des_query, code_hidden_states, code_hidden_states)
             loss_function = nn.MSELoss()
             desc_cross_att_logits = self.description_classifier(cls)
             description_loss = loss_function(desc_cross_att_logits, code_refined_representation)
-
-            lamda_1 = 0.2
-            vulnerability_code_representation = lamda_1 * cls + (1 - lamda_1) * code_refined_representation
+            vulnerability_code_representation = lambda_1 * cls + (1 - lambda_1) * code_refined_representation
             return vulnerability_code_representation, description_loss
         else:
             code_refined_representation = self.description_classifier(cls)
-            lamda_1 = 0.2
-            vulnerability_code_representation = lamda_1 * cls + (1 - lamda_1) * code_refined_representation
+            vulnerability_code_representation = lambda_1 * cls + (1 - lambda_1) * code_refined_representation
             return vulnerability_code_representation, None
 
 
 class DescriptionEncoder(nn.Module):
+    encoder: RobertaModel
+
     def __init__(self, args):
         super(DescriptionEncoder, self).__init__()
         self.encoder = RobertaModel.from_pretrained(args.pretrain_text_model_name)
@@ -130,6 +129,9 @@ class DescriptionEncoder(nn.Module):
 
 
 class ContrastiveModel(nn.Module):
+    code_encoder: CodeEncoder
+    desc_encoder: DescriptionEncoder
+
     def __init__(self, args):
         super(ContrastiveModel, self).__init__()
         self.code_encoder = CodeEncoder(args)

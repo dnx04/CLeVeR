@@ -1,15 +1,15 @@
-from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import Dataset
 import logging
-from tqdm import tqdm
-import json
-import random
-import numpy as np
 import torch
 import pickle
-from sklearn.preprocessing import LabelEncoder
-#from csg_generate import convert_function_to_CSG
 
 logger = logging.getLogger(__name__)
+
+
+def get_dataset_path(dataset_name, split):
+    """Returns path to dataset pickle file at dataset/<name>/<name>_<split>.pkl"""
+    return f'dataset/{dataset_name}/{dataset_name}_{split}.pkl'
+
 
 class TrainData(Dataset):
     def __init__(self, code_tokenizer, text_tokenizer, args, flag=''):
@@ -20,20 +20,24 @@ class TrainData(Dataset):
         self.code_max_length = 512
         self.text_max_length = 64
 
-        if 'train' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+        if 'pretrain' in flag:
+            path = get_dataset_path(args.dataset, 'pretrain')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.875))
+        elif 'train' in flag:
+            path = get_dataset_path(args.dataset, 'train')
+            with open(path, 'rb') as f:
+                self.examples = pickle.load(f)
         elif 'val' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'val')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.125))
         elif 'test' in flag:
-            with open('preprocessed_data/' + args.dataset + '_test.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'test')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
         else:
             print("file_path error!")
-
 
     def __len__(self):
         return len(self.examples)
@@ -97,20 +101,24 @@ class DetectionTestData(Dataset):
         self.code_max_length = 512
         self.text_max_length = 64
 
-        if 'train' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+        if 'pretrain' in flag:
+            path = get_dataset_path(args.dataset, 'pretrain')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.875))
+        elif 'train' in flag:
+            path = get_dataset_path(args.dataset, 'train')
+            with open(path, 'rb') as f:
+                self.examples = pickle.load(f)
         elif 'val' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'val')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.125))
         elif 'test' in flag:
-            with open('preprocessed_data/' + args.dataset + '_test.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'test')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
         else:
             print("file_path error!")
-
 
     def __len__(self):
         return len(self.examples)
@@ -157,7 +165,6 @@ class DetectionTestData(Dataset):
 
 cwe_list = ["78", "121", "122", "129", "190",
             "284", "390", "400", "416", "476"]
-# "78": 2432, "121": 241, "122": 270, "129": 658, "190": 3611, "284": 406, "390": 139, "400": 970, "416": 204, "476": 190
 int_list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 cwe2int = dict(zip(cwe_list, int_list))
 
@@ -171,20 +178,24 @@ class ClassificationTestData(Dataset):
         self.code_max_length = 512
         self.text_max_length = 64
 
-        if 'train' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+        if 'pretrain' in flag:
+            path = get_dataset_path(args.dataset, 'pretrain')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.875))
+        elif 'train' in flag:
+            path = get_dataset_path(args.dataset, 'train')
+            with open(path, 'rb') as f:
+                self.examples = pickle.load(f)
         elif 'val' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'val')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.125))
         elif 'test' in flag:
-            with open('preprocessed_data/' + args.dataset + '_test.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'test')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
         else:
             print("file_path error!")
-
 
     def __len__(self):
         return len(self.examples)
@@ -203,7 +214,6 @@ class ClassificationTestData(Dataset):
                             "A vulnerability of Use After Free.",
                             "A vulnerability of NULL Pointer Dereference."]
         cwe_label = cwe2int[cwe_id]
-        #idx = int(self.examples[item].idx)
 
         func_input = self.code_tokenizer(
             func,
@@ -245,20 +255,24 @@ class DetectionProbeData(Dataset):
         self.code_max_length = 512
         self.text_max_length = 64
 
-        if 'train' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+        if 'pretrain' in flag:
+            path = get_dataset_path(args.dataset, 'pretrain')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.875))
+        elif 'train' in flag:
+            path = get_dataset_path(args.dataset, 'train')
+            with open(path, 'rb') as f:
+                self.examples = pickle.load(f)
         elif 'val' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'val')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.125))
         elif 'test' in flag:
-            with open('preprocessed_data/' + args.dataset + '_test.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'test')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
         else:
             print("file_path error!")
-
 
     def __len__(self):
         return len(self.examples)
@@ -289,16 +303,21 @@ class ClassificationProbeData(Dataset):
         self.code_max_length = 512
         self.text_max_length = 64
 
-        if 'train' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+        if 'pretrain' in flag:
+            path = get_dataset_path(args.dataset, 'pretrain')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.875))
+        elif 'train' in flag:
+            path = get_dataset_path(args.dataset, 'train')
+            with open(path, 'rb') as f:
+                self.examples = pickle.load(f)
         elif 'val' in flag:
-            with open('preprocessed_data/' + args.dataset + '_train.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'val')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
-            self.examples = random.sample(self.examples, int(len(self.examples) * 0.125))
         elif 'test' in flag:
-            with open('preprocessed_data/' + args.dataset + '_test.pkl', 'rb') as f:
+            path = get_dataset_path(args.dataset, 'test')
+            with open(path, 'rb') as f:
                 self.examples = pickle.load(f)
         else:
             print("file_path error!")
@@ -308,7 +327,6 @@ class ClassificationProbeData(Dataset):
 
     def __getitem__(self, item):
         func = self.examples[item].func
-        #label = int(self.examples[item].label)
         cwe_id = self.examples[item].cwe_id
         if cwe_id not in cwe2int:
             print(f"cwe_id {cwe_id} not found in dictionary.")

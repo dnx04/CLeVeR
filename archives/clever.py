@@ -3,6 +3,7 @@
 from __future__ import absolute_import, division, print_function
 
 import argparse
+from typing import cast
 import logging
 import os
 import random
@@ -123,13 +124,13 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
                         checkpoint_prefix = args.to_checkpoint
                         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
                         if not os.path.exists(output_dir):
-                            os.makedirs(output_dir)                        
-                        model_to_save = model.module if hasattr(model,'module') else model
+                            os.makedirs(output_dir)
+                        model_to_save = model.module if hasattr(model, 'module') else model
 
-                        code_pretrain = model.code_encoder.encoder
-                        code_pretrain.save_pretrained("new_code_model")
-                        text_pretrain = model.desc_encoder.encoder
-                        text_pretrain.save_pretrained("new_text_model")
+                        code_encoder = cast(ContrastiveModel, model_to_save).code_encoder
+                        text_encoder = cast(ContrastiveModel, model_to_save).desc_encoder
+                        code_encoder.encoder.save_pretrained(os.path.join(output_dir, "code_encoder"))
+                        text_encoder.encoder.save_pretrained(os.path.join(output_dir, "text_encoder"))
 
                         output_dir = os.path.join(output_dir, '{}'.format('model.bin')) 
                         torch.save(model_to_save.state_dict(), output_dir)
@@ -140,6 +141,175 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
 def compute_similarity(code_embeds, desc_embeds):
     similarity = torch.nn.functional.cosine_similarity(code_embeds, desc_embeds)
     return similarity
+
+
+def evaluate_on_val(args, model, code_tokenizer, text_tokenizer):
+    """Evaluate model on validation set."""
+    val_dataset = DetectionTestData(code_tokenizer, text_tokenizer, args, flag='val')
+    val_sampler = SequentialSampler(val_dataset)
+    val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=args.eval_batch_size, num_workers=8, pin_memory=True)
+
+    model.eval()
+    y_preds = []
+    y_trues = []
+    for batch in tqdm(val_dataloader, desc="Validating"):
+        (func_input_ids, func_attention_mask, description_0_input_ids, description_0_attention_mask,
+         description_1_input_ids, description_1_attention_mask, label) = [x.to(args.device) for x in batch]
+        with torch.no_grad():
+            code_embedding, description_0_embedding = \
+                model(func_input_ids, func_attention_mask, description_0_input_ids, description_0_attention_mask, flag="test")
+            _, description_1_embedding = \
+                model(func_input_ids, func_attention_mask, description_1_input_ids, description_1_attention_mask, flag="test")
+            similarity0 = compute_similarity(code_embedding, description_0_embedding)
+            similarity1 = compute_similarity(code_embedding, description_1_embedding)
+            similarity = torch.stack([similarity0, similarity1], dim=-1)
+            preds = similarity.argmax(dim=-1)
+            y_preds.append(preds.cpu().numpy())
+            y_trues.append(label.cpu().numpy())
+
+    y_preds = np.concatenate(y_preds, 0)
+    y_trues = np.concatenate(y_trues, 0)
+
+    from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+    accuracy = accuracy_score(y_trues, y_preds)
+    recall = recall_score(y_trues, y_preds)
+    precision = precision_score(y_trues, y_preds)
+    f1 = f1_score(y_trues, y_preds)
+    result = {
+        "accuracy": float(accuracy),
+        "recall": float(recall),
+        "precision": float(precision),
+        "f1": float(f1)
+    }
+
+    logger.info("***** Val results *****")
+    for key in sorted(result.keys()):
+        logger.info("  %s = %s", key, str(round(result[key], 4)))
+
+    return result
+
+
+def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
+    # Build dataloader
+    train_sampler = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(
+        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
+        num_workers=8, pin_memory=True
+    )
+
+    args.max_steps = args.epochs * len(train_dataloader)
+    args.warmup_steps = args.max_steps // 5
+    model.to(args.device)
+
+    # Prepare optimizer and schedule (linear warmup and decay)
+    no_decay = ['bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+         'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
+                                                num_training_steps=args.max_steps)
+
+    # Mixed precision training
+    scaler = GradScaler(device="cuda")
+
+    # Multi-gpu training
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
+
+    # Train step
+    logger.info("***** Running training *****")
+    logger.info("  Num examples = %d", len(train_dataset))
+    logger.info("  Num Epochs = %d", args.epochs)
+    logger.info("  Total optimization steps = %d", args.max_steps)
+    logger.info("  Early stopping patience = %d", args.patience)
+
+    global_step = 0
+    best_f1 = 0.0
+    epochs_no_improve = 0
+    stopping = False
+
+    model.zero_grad()
+
+    for idx in range(args.epochs):
+        if stopping:
+            break
+
+        bar = tqdm(train_dataloader, total=len(train_dataloader), desc=f"Epoch {idx}")
+        tr_num = 0
+        train_loss = 0
+
+        for step, batch in enumerate(bar):
+            (func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
+             source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask) = [x.to(args.device) for x in batch]
+            model.train()
+            with autocast(device_type='cuda'):
+                loss = model(func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
+                             source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask, "train")
+
+            if args.n_gpu > 1:
+                loss = loss.mean()
+
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            tr_num += 1
+            train_loss += loss.item()
+
+            avg_loss = round(train_loss / tr_num, 5)
+            bar.set_description("epoch {} loss {}".format(idx, avg_loss))
+
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
+
+        # Evaluate on val set at end of each epoch
+        logger.info("Epoch %d complete — evaluating on val set...", idx)
+        results = evaluate_on_val(args, model, code_tokenizer, text_tokenizer)
+        val_f1 = results['f1']
+
+        # Save best checkpoint
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            epochs_no_improve = 0
+            logger.info("  Best val F1: %s", round(best_f1, 4))
+            logger.info("  " + "*" * 20)
+            logger.info("  Saving checkpoint...")
+
+            checkpoint_prefix = args.to_checkpoint
+            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model
+
+            code_encoder = cast(ContrastiveModel, model_to_save).code_encoder
+            text_encoder = cast(ContrastiveModel, model_to_save).desc_encoder
+            code_encoder.encoder.save_pretrained(os.path.join(output_dir, "code_encoder"))
+            text_encoder.encoder.save_pretrained(os.path.join(output_dir, "text_encoder"))
+
+            output_dir = os.path.join(output_dir, 'model.bin')
+            torch.save(model_to_save.state_dict(), output_dir)
+            logger.info("Saving model checkpoint to %s", output_dir)
+            torch.cuda.empty_cache()
+        else:
+            epochs_no_improve += 1
+            logger.info("  Val F1: %s (no improvement, %d/%d)", round(val_f1, 4), epochs_no_improve, args.patience)
+
+            if epochs_no_improve >= args.patience:
+                logger.info("Early stopping triggered at epoch %d", idx)
+                stopping = True
+
+    logger.info("Training complete. Best val F1: %s", round(best_f1, 4))
+    return best_f1
 
 
 def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=False):
@@ -391,13 +561,12 @@ def main():
     parser.add_argument("--to_checkpoint", default=None, type=str,
                         help="the checkpoint save to")
 
-
     parser.add_argument("--code_length", default=512, type=int,
                         help="Optional Code input sequence length after tokenization.") 
-    parser.add_argument("--pretrain_text_model_name", default=None, type=str,
-                        help="The model checkpoint for weights initialization.")
-    parser.add_argument("--pretrain_code_model_name", default=None, type=str,
-                        help="The model checkpoint for weights initialization.")
+    parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str,
+                        help="The model checkpoint for text (description) encoder.")
+    parser.add_argument("--pretrain_code_model_name", default="microsoft/codebert-base", type=str,
+                        help="The model checkpoint for code encoder.")
 
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
@@ -437,6 +606,8 @@ def main():
                         help="random seed for initialization")
     parser.add_argument('--epochs', type=int, default=1,
                         help="training epochs")
+    parser.add_argument('--patience', type=int, default=5,
+                        help="Early stopping patience (epochs without improvement)")
 
     args = parser.parse_args()
 
@@ -465,11 +636,13 @@ def main():
 
     # Train Phrase
     if args.do_train:
-        train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag='train')
-        #checkpoint_prefix = args.from_checkpoint + '/model.bin'
-        #output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-        #vul_model.load_state_dict(torch.load(output_dir))
-        #vul_model.to(args.device)
+        train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag='pretrain')
+        if args.from_checkpoint:
+            checkpoint_prefix = args.from_checkpoint + '/model.bin'
+            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+            vul_model.load_state_dict(torch.load(output_dir))
+            vul_model.to(args.device)
+            logger.info("Loaded model from %s", output_dir)
         train(args, train_dataset, vul_model, code_tokenizer, text_tokenizer)
 
     # Test Phrase

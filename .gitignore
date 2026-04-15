@@ -12,7 +12,7 @@ wheels/
 # Data files
 dataset/*.jsonl
 dataset/data/
-preprocessed_data/
+dataset/*/
 
 # Saved models
 saved_models/
