@@ -3,21 +3,16 @@
 from __future__ import absolute_import, division, print_function
 
 import argparse
-import glob
 import logging
 import os
 import random
-import re
-import shutil
-import json
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-                          RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer)
-from tqdm import tqdm, trange
-import multiprocessing
-from data_preprocess import Preprocess
+from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
+from transformers import (get_linear_schedule_with_warmup,
+                          RobertaTokenizer)
+from torch.optim import AdamW
+from tqdm import tqdm
 from model import ContrastiveModel
 from dataset import TrainData, DetectionTestData, ClassificationTestData
 
@@ -68,7 +63,7 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
     logger.info("  Total optimization steps = %d", args.max_steps)
     
     global_step=0
-    tr_loss, logging_loss,avg_loss,tr_nb,tr_num,train_loss = 0.0, 0.0,0.0,0,0,0
+    tr_loss, avg_loss, tr_num, train_loss = 0.0, 0.0, 0, 0
     best_f1=0
 
     model.zero_grad()
@@ -151,8 +146,7 @@ def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     logger.info("***** Running evaluation *****")
     logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    
-    eval_loss = 0.0
+
     nb_eval_steps = 0
     model.eval()
     y_preds=[]
@@ -170,7 +164,6 @@ def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
             similarity = torch.stack([similarity0, similarity1], dim=-1)
             preds = similarity.argmax(dim=-1)
 
-            #eval_loss += lm_loss.mean().item()
             y_preds.append(preds.cpu().numpy())
             y_trues.append(label.cpu().numpy())
         nb_eval_steps += 1
@@ -216,7 +209,6 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False):
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
     y_preds = []
@@ -236,7 +228,6 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False):
             similarity = torch.stack([similarity0, similarity1], dim=-1)
             preds = similarity.argmax(dim=-1)
 
-            # eval_loss += lm_loss.mean().item()
             y_preds.append(preds.cpu().numpy())
             y_trues.append(label.cpu().numpy())
         nb_eval_steps += 1
@@ -244,7 +235,6 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False):
     # Calculate results
     y_preds = np.concatenate(y_preds, 0)
     y_trues = np.concatenate(y_trues, 0)
-    #print("y_preds: ", sum(y_preds))
 
     from sklearn.metrics import accuracy_score
     accuracy = accuracy_score(y_trues, y_preds)
@@ -283,20 +273,17 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
     y_preds = []
     y_trues = []
     for batch in tqdm(test_dataloader):
-        (func_input_ids, func_attention_mask, description_input_ids_list, description_attention_mask_list, label, idx) = \
+        (func_input_ids, func_attention_mask, description_input_ids_list, description_attention_mask_list, label) = \
             [x.to(args.device) for x in batch]
-        #print("description_input_ids_list: ", description_input_ids_list.size())
         description_input_ids_list = description_input_ids_list.permute(1, 0, 2)
         description_attention_mask_list = description_attention_mask_list.permute(1, 0, 2)
         similarity_all = []
         with torch.no_grad():
-            #print("length:", len(description_input_ids_list))
             for i in range(len(description_input_ids_list)):
                 description_input_ids = description_input_ids_list[i]
                 description_attention_mask = description_attention_mask_list[i]
@@ -314,7 +301,6 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     # Calculate results
     y_preds = np.concatenate(y_preds, 0)
     y_trues = np.concatenate(y_trues, 0)
-    #print("y_preds: ", sum(y_preds))
 
     from sklearn.metrics import accuracy_score
     accuracy = accuracy_score(y_trues, y_preds)
@@ -352,29 +338,32 @@ def predict(args, model, code_tokenizer, text_tokenizer, best_threshold=0.0):
     logger.info("***** Running Predict *****")
     logger.info("  Num examples = %d", len(pred_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
-    logits=[]  
-    y_trues=[]
-    for batch in pred_dataloader:
-        (inputs_ids, position_idx, csg_edge_mask, labels) = [x.to(args.device) for x in batch]
+    y_preds = []
+    for batch in tqdm(pred_dataloader):
+        (func_input_ids, func_attention_mask, description_0_input_ids, description_0_attention_mask,
+         description_1_input_ids, description_1_attention_mask, label) = [x.to(args.device) for x in batch]
         with torch.no_grad():
-            lm_loss,logit = model(inputs_ids, position_idx, csg_edge_mask, labels)
-            eval_loss += lm_loss.mean().item()
-            logits.append(logit.cpu().numpy())
-            y_trues.append(labels.cpu().numpy())
+            code_embedding, description_0_embedding = \
+                model(func_input_ids, func_attention_mask, description_0_input_ids, description_0_attention_mask, flag="test")
+            _, description_1_embedding = \
+                model(func_input_ids, func_attention_mask, description_1_input_ids, description_1_attention_mask, flag="test")
+            similarity0 = compute_similarity(code_embedding, description_0_embedding)
+            similarity1 = compute_similarity(code_embedding, description_1_embedding)
+            similarity = torch.stack([similarity0, similarity1], dim=-1)
+            preds = similarity.argmax(dim=-1)
+            y_preds.append(preds.cpu().numpy())
         nb_eval_steps += 1
-    
+
     # Output results
-    logits=np.concatenate(logits,0)
-    y_preds=logits[:,1]>best_threshold
-    with open(os.path.join(args.output_dir,"predictions.txt"),'w') as f:
-        for example,pred in zip(pred_dataset.examples,y_preds):
+    y_preds = np.concatenate(y_preds, 0)
+    with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
+        for example, pred in zip(pred_dataset.examples, y_preds):
             if pred:
-                f.write(example.url+'\t'+'1'+'\n')
+                f.write(example.url + '\t' + '1' + '\n')
             else:
-                f.write(example.url+'\t'+'0'+'\n')
+                f.write(example.url + '\t' + '0' + '\n')
                                                 
 def main():
     # Setup parser
@@ -455,9 +444,7 @@ def main():
     # Setup seed
     set_seed(args)
 
-    code_config = RobertaConfig.from_pretrained(args.pretrain_code_model_name)
     code_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_code_model_name)
-    text_config = RobertaConfig.from_pretrained(args.pretrain_text_model_name)
     text_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_text_model_name)
 
     vul_model = ContrastiveModel(args)

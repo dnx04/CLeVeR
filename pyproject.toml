@@ -12,10 +12,6 @@ dependencies = [
     "numpy>=2.0.0",
 ]
 
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
 [tool.uv]
 index-url = "https://pypi.org/simple"
 extra-index-url = ["https://download.pytorch.org/whl/cu126"]

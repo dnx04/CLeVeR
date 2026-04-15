@@ -2,7 +2,6 @@
 from __future__ import absolute_import, division, print_function
 
 import argparse
-import glob
 import logging
 import os
 import random
@@ -10,14 +9,14 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
-from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-                          RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer)
-from tqdm import tqdm, trange
-import multiprocessing
-from data_preprocess import Preprocess
+from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
+from transformers import (get_linear_schedule_with_warmup,
+                          RobertaTokenizer)
+from torch.optim import AdamW
+from tqdm import tqdm
+from typing import Any, Dict, List, Optional, Tuple, Union
 from model import ContrastiveModel, LinearProbe
-from dataset import TrainData, DetectionTestData, DetectionProbeData, ClassificationProbeData
+from dataset import DetectionProbeData, ClassificationProbeData
 
 cpu_cont = 16
 logger = logging.getLogger(__name__)
@@ -70,7 +69,7 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer, classifier
     logger.info("  Total optimization steps = %d", args.max_steps)
 
     global_step = 0
-    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
+    tr_loss, avg_loss, tr_num, train_loss = 0.0, 0.0, 0, 0
     best_f1 = 0
 
     model.eval()
@@ -144,7 +143,8 @@ def compute_similarity(code_embeds, desc_embeds):
     return similarity
 
 
-def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=False, classifier=None):
+def evaluate(args, model: ContrastiveModel, code_tokenizer: RobertaTokenizer, text_tokenizer: RobertaTokenizer,
+             eval_when_training: bool = False, classifier: Optional[LinearProbe] = None) -> Dict[str, float]:
     # Build dataloader
     eval_dataset = DetectionProbeData(code_tokenizer, text_tokenizer, args, flag='val')
     eval_sampler = SequentialSampler(eval_dataset)
@@ -159,9 +159,9 @@ def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
+    assert classifier is not None, "classifier must not be None"
     classifier.eval()
 
     logits = []
@@ -206,7 +206,8 @@ def evaluate(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     return result
 
 
-def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False, classifier=None):
+def test(args, model: ContrastiveModel, code_tokenizer: RobertaTokenizer, text_tokenizer: RobertaTokenizer,
+         eval_when_training: bool = False, classifier: Optional[LinearProbe] = None) -> Dict[str, float]:
     # Build dataloader
     test_dataset = DetectionProbeData(code_tokenizer, text_tokenizer, args, flag='test')
     test_sampler = SequentialSampler(test_dataset)
@@ -221,9 +222,9 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False, 
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
+    assert classifier is not None, "classifier must not be None"
     classifier.eval()
 
     logits = []
@@ -235,7 +236,6 @@ def test(args, model, code_tokenizer, text_tokenizer, eval_when_training=False, 
             output = classifier(func_representation)
             logit = F.softmax(output, dim=-1)
 
-            # eval_loss += lm_loss.mean().item()
             logits.append(logit.cpu().numpy())
             y_trues.append(label.cpu().numpy())
         nb_eval_steps += 1
@@ -284,7 +284,6 @@ def evaluate_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training
     logger.info("  Num examples = %d", len(eval_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
     classifier.eval()
@@ -346,7 +345,6 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
     logger.info("  Num examples = %d", len(test_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
     classifier.eval()
@@ -360,7 +358,6 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
             output = classifier(func_representation)
             logit = F.softmax(output, dim=-1)
 
-            # eval_loss += lm_loss.mean().item()
             logits.append(logit.cpu().numpy())
             y_trues.append(label.cpu().numpy())
         nb_eval_steps += 1
@@ -396,7 +393,7 @@ def test_cls(args, model, code_tokenizer, text_tokenizer, eval_when_training=Fal
 
 def predict(args, model, code_tokenizer, text_tokenizer, best_threshold=0.0):
     # Build dataloader
-    pred_dataset = DetectionTestData(code_tokenizer, text_tokenizer, args, flag='test')
+    pred_dataset = DetectionProbeData(code_tokenizer, text_tokenizer, args, flag='test')
     pred_sampler = SequentialSampler(pred_dataset)
     pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
@@ -408,18 +405,16 @@ def predict(args, model, code_tokenizer, text_tokenizer, best_threshold=0.0):
     logger.info("***** Running Predict *****")
     logger.info("  Num examples = %d", len(pred_dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
     logits = []
     y_trues = []
     for batch in pred_dataloader:
-        (inputs_ids, position_idx, csg_edge_mask, labels) = [x.to(args.device) for x in batch]
+        (func_input_ids, func_attention_mask, label) = [x.to(args.device) for x in batch]
         with torch.no_grad():
-            lm_loss, logit = model(inputs_ids, position_idx, csg_edge_mask, labels)
-            eval_loss += lm_loss.mean().item()
-            logits.append(logit.cpu().numpy())
-            y_trues.append(labels.cpu().numpy())
+            func_representation, _ = model(func_input_ids, func_attention_mask, flag="probe")
+            logits.append(func_representation.cpu().numpy())
+            y_trues.append(label.cpu().numpy())
         nb_eval_steps += 1
 
     # Output results

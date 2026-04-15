@@ -2,7 +2,7 @@
 #
 # ljy@20250707
 #
-python linear_probe.py \
+uv run python ../linear_probe.py \
     --output_dir=saved_models \
     --pretrain_text_model_name=pretrain_text_model \
     --pretrain_code_model_name=pretrain_code_model \
