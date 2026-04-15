@@ -114,8 +114,8 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
                 if global_step % args.save_steps == 0:
                     results = test(args, model, code_tokenizer, text_tokenizer, eval_when_training=True)
                     # Save model checkpoint
-                    if results['eval_f1']>best_f1:
-                        best_f1=results['eval_f1']
+                    if results['test_f1']>best_f1:
+                        best_f1=results['test_f1']
                         logger.info("  "+"*"*20)  
                         logger.info("  Best f1:%s",round(best_f1,4))
                         logger.info("  "+"*"*20)                          
