@@ -1,17 +1,7 @@
-
-
 class ExampleFeature(object):
     """The code and description feature for an example."""
-    def __init__(self,
-                 func,
-                 func_name,
-                 cwe_id,
-                 source,
-                 sink,
-                 description,
-                 label,
-                 idx
-                 ):
+
+    def __init__(self, func, func_name, cwe_id, source, sink, description, label, idx):
 
         self.func = func
         self.func_name = func_name
@@ -33,4 +23,6 @@ def generate_description(js):
     label = js["label"]
     idx = js["idx"]
     description = js["reason"]
-    return ExampleFeature(func, func_name, cwe_id, source, sink, description, label, idx)
+    return ExampleFeature(
+        func, func_name, cwe_id, source, sink, description, label, idx
+    )

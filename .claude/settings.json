@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '\"\\(.tool_input.file_path)\"' | grep -E '^(src/|dataset/|scripts/|pyproject.toml)' | { read -r f; [ -s \"$f\" ] && python3 -c \"\nimport sys, json, re\npath = '$f'.strip()\nwith open(path) as fh:\n    content = fh.read()\n\n# Extract functions, classes, IMPROVEMENT markers\nfuncs = re.findall(r'def (\\w+)', content)\nclasses = re.findall(r'class (\\w+)', content)\nimpl_match = re.findall(r'IMPROVEMENT[:\\s#]*(\\d+)', content)\nablation = re.findall(r'--(\\w+(?:_\\w+)*)\\s+\\{', content)\n\nchanges = []\nif classes: changes.append('Classes: ' + ', '.join(classes))\nif funcs: changes.append('Functions: ' + ', '.join(funcs[:5]))\nif impl_match: changes.append('IMPROVEMENT markers: ' + ', '.join(impl_match))\nif ablation: changes.append('Ablation flags: ' + ', '.join(ablation[:5]))\n\nentry = f'## {path}\\n' + ('\\n'.join(changes) if changes else '*(no parseable symbols)*')\n\nchangelog_path = '.claude/changes.md'\nwith open(changelog_path, 'a') as ch:\n    ch.write(entry + '\\n\\n')\nprint('synced:', path)\n\" || echo \"hook-py-err\"; } || echo \"no-match\"",
+            "timeout": 30,
+            "statusMessage": "Syncing change to .claude/changes.md"
+          }
+        ]
+      }
+    ]
+  }
+}

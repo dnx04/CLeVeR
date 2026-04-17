@@ -28,11 +28,17 @@ class CrossAttention(nn.Module):
         self.value_layer = nn.Linear(att_hidden_size, att_hidden_size)
         self.attention = nn.MultiheadAttention(att_hidden_size, num_heads=8)
 
-    def forward(self, query, key, value):       # default: batch_first=False
+    def forward(self, query, key, value):  # default: batch_first=False
         # Add an extra dimension for the number of heads
-        query = self.query_layer(query).unsqueeze(0)  # shape: (1, batch_size, hidden_size), 1 is target seq_len
-        key = self.key_layer(key).permute(1, 0, 2)  # shape: (seq_len, batch_size, hidden_size)
-        value = self.value_layer(value).permute(1, 0, 2)  # shape: (seq_len, batch_size, hidden_size)
+        query = self.query_layer(query).unsqueeze(
+            0
+        )  # shape: (1, batch_size, hidden_size), 1 is target seq_len
+        key = self.key_layer(key).permute(
+            1, 0, 2
+        )  # shape: (seq_len, batch_size, hidden_size)
+        value = self.value_layer(value).permute(
+            1, 0, 2
+        )  # shape: (seq_len, batch_size, hidden_size)
 
         # Multi-head Attention expects (seq_len, batch_size, hidden_size) for key and value
         attn_output, _ = self.attention(query, key, value)
@@ -100,15 +106,23 @@ class CodeEncoder(nn.Module):
         lambda_1 = 0.2
 
         if flag == "train":
-            code_refined_representation = self.cross_attention(des_query, code_hidden_states, code_hidden_states)
+            code_refined_representation = self.cross_attention(
+                des_query, code_hidden_states, code_hidden_states
+            )
             loss_function = nn.MSELoss()
             desc_cross_att_logits = self.description_classifier(cls)
-            description_loss = loss_function(desc_cross_att_logits, code_refined_representation)
-            vulnerability_code_representation = lambda_1 * cls + (1 - lambda_1) * code_refined_representation
+            description_loss = loss_function(
+                desc_cross_att_logits, code_refined_representation
+            )
+            vulnerability_code_representation = (
+                lambda_1 * cls + (1 - lambda_1) * code_refined_representation
+            )
             return vulnerability_code_representation, description_loss
         else:
             code_refined_representation = self.description_classifier(cls)
-            vulnerability_code_representation = lambda_1 * cls + (1 - lambda_1) * code_refined_representation
+            vulnerability_code_representation = (
+                lambda_1 * cls + (1 - lambda_1) * code_refined_representation
+            )
             return vulnerability_code_representation, None
 
 
@@ -137,24 +151,51 @@ class ContrastiveModel(nn.Module):
         self.code_encoder = CodeEncoder(args)
         self.desc_encoder = DescriptionEncoder(args)
 
-    def forward(self, func_input_ids, func_attention_mask, description_input_ids=None, description_attention_mask=None,
-                source_input_ids=None, source_attention_mask=None, sink_input_ids=None, sink_attention_mask=None, flag=None):
+    def forward(
+        self,
+        func_input_ids,
+        func_attention_mask,
+        description_input_ids=None,
+        description_attention_mask=None,
+        source_input_ids=None,
+        source_attention_mask=None,
+        sink_input_ids=None,
+        sink_attention_mask=None,
+        flag=None,
+    ):
 
         if flag == "train":
-            reason_cls = self.desc_encoder(input_ids=description_input_ids, attention_mask=description_attention_mask)
-            source_cls = self.desc_encoder(input_ids=source_input_ids, attention_mask=source_attention_mask)
-            sink_cls = self.desc_encoder(input_ids=sink_input_ids, attention_mask=sink_attention_mask)
+            reason_cls = self.desc_encoder(
+                input_ids=description_input_ids,
+                attention_mask=description_attention_mask,
+            )
+            source_cls = self.desc_encoder(
+                input_ids=source_input_ids, attention_mask=source_attention_mask
+            )
+            sink_cls = self.desc_encoder(
+                input_ids=sink_input_ids, attention_mask=sink_attention_mask
+            )
             lamda_0 = 0.25
-            description_representation = lamda_0 * source_cls + lamda_0 * sink_cls + (1 - 2 * lamda_0) * reason_cls
+            description_representation = (
+                lamda_0 * source_cls
+                + lamda_0 * sink_cls
+                + (1 - 2 * lamda_0) * reason_cls
+            )
         elif flag == "test":
-            description_representation = self.desc_encoder(input_ids=description_input_ids, attention_mask=description_attention_mask)
+            description_representation = self.desc_encoder(
+                input_ids=description_input_ids,
+                attention_mask=description_attention_mask,
+            )
         else:
             description_representation = None
 
-        vulnerability_code_representation, description_loss = self.code_encoder(func_input_ids, func_attention_mask,
-                                                                                description_representation, flag)
+        vulnerability_code_representation, description_loss = self.code_encoder(
+            func_input_ids, func_attention_mask, description_representation, flag
+        )
         if flag == "train":
-            info_loss = info_nce_loss(vulnerability_code_representation, description_representation)
+            info_loss = info_nce_loss(
+                vulnerability_code_representation, description_representation
+            )
             alpha = 0.7
             loss = info_loss + alpha * description_loss
             return loss
@@ -171,4 +212,3 @@ class LinearProbe(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
-

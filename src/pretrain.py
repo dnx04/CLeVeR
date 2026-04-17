@@ -34,24 +34,44 @@ def set_seed(args):
 def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(
-        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,
-        num_workers=args.num_workers, pin_memory=True, persistent_workers=True,
-        prefetch_factor=4
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     args.max_steps = args.epochs * len(train_dataloader)
     args.warmup_steps = args.max_steps // 5
     model.to(args.device)
 
-    no_decay = ['bias', 'LayerNorm.weight']
+    no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [
+                p
+                for n, p in model.named_parameters()
+                if any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-                                                num_training_steps=args.max_steps)
+    optimizer = AdamW(
+        optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon
+    )
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps
+    )
 
     scaler = GradScaler(device="cuda")
 
@@ -71,13 +91,28 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
         train_loss = 0.0
 
         for step, batch in enumerate(bar):
-            (func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
-             source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask) = [x.to(args.device) for x in batch]
+            (
+                func_input_ids,
+                func_attention_mask,
+                description_input_ids,
+                description_attention_mask,
+                source_input_ids,
+                source_attention_mask,
+                sink_input_ids,
+                sink_attention_mask,
+            ) = [x.to(args.device) for x in batch]
             model.train()
-            with autocast(device_type='cuda'):
+            with autocast(device_type="cuda"):
                 loss = model(
-                    func_input_ids, func_attention_mask, description_input_ids, description_attention_mask,
-                    source_input_ids, source_attention_mask, sink_input_ids, sink_attention_mask, "train"
+                    func_input_ids,
+                    func_attention_mask,
+                    description_input_ids,
+                    description_attention_mask,
+                    source_input_ids,
+                    source_attention_mask,
+                    sink_input_ids,
+                    sink_attention_mask,
+                    "train",
                 )
 
             if args.n_gpu > 1:
@@ -92,7 +127,9 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
 
             tr_num += 1
             train_loss += loss.item()
-            bar.set_description("epoch {} loss {}".format(idx, round(train_loss / tr_num, 5)))
+            bar.set_description(
+                "epoch {} loss {}".format(idx, round(train_loss / tr_num, 5))
+            )
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 scaler.step(optimizer)
@@ -108,12 +145,12 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
-    model_to_save = model.module if hasattr(model, 'module') else model
+    model_to_save = model.module if hasattr(model, "module") else model
     code_encoder = cast(ContrastiveModel, model_to_save).code_encoder
     text_encoder = cast(ContrastiveModel, model_to_save).desc_encoder
     code_encoder.encoder.save_pretrained(os.path.join(checkpoint_dir, "code_encoder"))
     text_encoder.encoder.save_pretrained(os.path.join(checkpoint_dir, "text_encoder"))
-    torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, 'model.bin'))
+    torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, "model.bin"))
     logger.info("Saved checkpoint to %s", checkpoint_dir)
 
 
@@ -126,7 +163,9 @@ def main():
     parser.add_argument("--to_checkpoint", default=None, type=str)
     parser.add_argument("--code_length", default=512, type=int)
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
-    parser.add_argument("--pretrain_code_model_name", default="microsoft/codebert-base", type=str)
+    parser.add_argument(
+        "--pretrain_code_model_name", default="microsoft/codebert-base", type=str
+    )
     parser.add_argument("--train_batch_size", default=256, type=int)
     parser.add_argument("--eval_batch_size", default=512, type=int)
     parser.add_argument("--hidden_size", default=768, type=int)
@@ -137,9 +176,9 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--warmup_steps", default=0, type=int)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--epochs', type=int, default=1)
-    parser.add_argument('--do_train', action='store_true')
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--do_train", action="store_true")
 
     args = parser.parse_args()
 
@@ -147,8 +186,11 @@ def main():
     args.n_gpu = torch.cuda.device_count()
     args.device = device
 
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
     logger.warning("device: %s, n_gpu: %s", device, args.n_gpu)
 
     set_seed(args)
@@ -162,9 +204,9 @@ def main():
     logger.info("Training parameters: %s", args)
 
     if args.do_train:
-        train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag='pretrain')
+        train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag="pretrain")
         if args.from_checkpoint:
-            ckpt_path = os.path.join(args.output_dir, args.from_checkpoint, 'model.bin')
+            ckpt_path = os.path.join(args.output_dir, args.from_checkpoint, "model.bin")
             model.load_state_dict(torch.load(ckpt_path))
             model.to(args.device)
             logger.info("Loaded model from %s", ckpt_path)

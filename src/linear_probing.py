@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from model import ContrastiveModel, LinearProbe
+from data import NUM_CLASSES, CWE_LIST
 
 logger = logging.getLogger(__name__)
 
@@ -29,22 +30,30 @@ def set_seed(args):
 # ---------------------------------------------------------------------------
 # DataLoader builders
 # ---------------------------------------------------------------------------
-def build_probe_dataloader(args, code_tokenizer, text_tokenizer, flag, batch_size, task):
+def build_probe_dataloader(
+    args, code_tokenizer, text_tokenizer, flag, batch_size, task
+):
     """Build a DataLoader for probe data.
-    task: 'detection' (binary) or 'classification' (10-class CWE)
+    task: 'detection' (binary) or 'classification' (unified CWE)
+    Both use ClassificationProbeData which returns unified CWE labels (0=safe, 1-90=CWE).
     """
-    if task == 'detection':
-        from data import DetectionProbeData
-        dataset = DetectionProbeData(code_tokenizer, text_tokenizer, args, flag=flag)
-    else:
-        from data import ClassificationProbeData
-        dataset = ClassificationProbeData(code_tokenizer, text_tokenizer, args, flag=flag)
+    from data import ClassificationProbeData
 
-    sampler = SequentialSampler(dataset) if flag in ('val', 'test') else RandomSampler(dataset)
+    dataset = ClassificationProbeData(code_tokenizer, text_tokenizer, args, flag=flag)
+
+    sampler = (
+        SequentialSampler(dataset)
+        if flag in ("val", "test")
+        else RandomSampler(dataset)
+    )
     return DataLoader(
-        dataset, sampler=sampler, batch_size=batch_size,
-        num_workers=args.num_workers, pin_memory=True,
-        persistent_workers=True, prefetch_factor=4
+        dataset,
+        sampler=sampler,
+        batch_size=batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
 
@@ -56,7 +65,7 @@ def encode_code_batch(model, func_input_ids, func_attention_mask, device):
     with torch.no_grad():
         outputs = model.code_encoder.encoder(
             input_ids=func_input_ids.to(device),
-            attention_mask=func_attention_mask.to(device)
+            attention_mask=func_attention_mask.to(device),
         )
         cls = outputs.last_hidden_state[:, 0, :]
         cls = model.code_encoder.code_adapter(cls)
@@ -71,7 +80,9 @@ def extract_features(model, dataloader, device):
     features, labels = [], []
     for batch in tqdm(dataloader, desc="Extracting features"):
         func_input_ids, func_attention_mask, label = [x.to(device) for x in batch]
-        code_repr = encode_code_batch(model, func_input_ids, func_attention_mask, device)
+        code_repr = encode_code_batch(
+            model, func_input_ids, func_attention_mask, device
+        )
         features.append(code_repr.cpu())
         labels.append(label.cpu())
     return torch.cat(features, dim=0), torch.cat(labels, dim=0)
@@ -80,8 +91,18 @@ def extract_features(model, dataloader, device):
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def evaluate_probe(classifier, features, labels, device, num_classes):
-    """Evaluate classifier on pre-extracted features + labels."""
+def evaluate_unified(classifier, features, labels, device):
+    """
+    Unified evaluation computing all three metric groups from a single prediction pass.
+
+    Labels: 0 = safe, 1-90 = CWE types (unified CWE mapping)
+    Predictions: argmax from a classifier head trained on NUM_CLASSES classes.
+
+    Returns:
+        multiclass_result: multi-class F1 over all 91 classes
+        detection_result: binary F1 (safe vs vulnerable)
+        classification_result: F1 on vulnerable samples only
+    """
     classifier.eval()
     y_preds, y_trues = [], []
 
@@ -99,38 +120,91 @@ def evaluate_probe(classifier, features, labels, device, num_classes):
     y_trues = np.concatenate(y_trues, 0)
 
     from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
-    avg = 'weighted' if num_classes > 2 else 'binary'
-    result = {
+
+    # Metric 1: Multi-class F1 over all NUM_CLASSES
+    multiclass_result = {
         "accuracy": accuracy_score(y_trues, y_preds),
-        "recall": recall_score(y_trues, y_preds, average=avg),
-        "precision": precision_score(y_trues, y_preds, average=avg),
-        "f1": f1_score(y_trues, y_preds, average=avg)
+        "recall_macro": recall_score(
+            y_trues, y_preds, average="macro", zero_division=0
+        ),
+        "precision_macro": precision_score(
+            y_trues, y_preds, average="macro", zero_division=0
+        ),
+        "f1_macro": f1_score(y_trues, y_preds, average="macro", zero_division=0),
+        "recall_weighted": recall_score(
+            y_trues, y_preds, average="weighted", zero_division=0
+        ),
+        "precision_weighted": precision_score(
+            y_trues, y_preds, average="weighted", zero_division=0
+        ),
+        "f1_weighted": f1_score(y_trues, y_preds, average="weighted", zero_division=0),
     }
-    return result
+
+    # Metric 2: Detection F1 — collapse to binary (safe=0, vulnerable=1)
+    detect_trues = (y_trues != 0).astype(int)
+    detect_preds = (y_preds != 0).astype(int)
+    detection_result = {
+        "accuracy": accuracy_score(detect_trues, detect_preds),
+        "recall": recall_score(detect_trues, detect_preds),
+        "precision": precision_score(detect_trues, detect_preds),
+        "f1": f1_score(detect_trues, detect_preds),
+    }
+
+    # Metric 3: Classification F1 — only on vulnerable ground-truth samples
+    vuln_mask = y_trues != 0
+    if vuln_mask.sum() > 0:
+        classification_result = {
+            "accuracy": accuracy_score(y_trues[vuln_mask], y_preds[vuln_mask]),
+            "recall_weighted": recall_score(
+                y_trues[vuln_mask],
+                y_preds[vuln_mask],
+                average="weighted",
+                zero_division=0,
+            ),
+            "precision_weighted": precision_score(
+                y_trues[vuln_mask],
+                y_preds[vuln_mask],
+                average="weighted",
+                zero_division=0,
+            ),
+            "f1_weighted": f1_score(
+                y_trues[vuln_mask],
+                y_preds[vuln_mask],
+                average="weighted",
+                zero_division=0,
+            ),
+            "num_vulnerable_samples": int(vuln_mask.sum()),
+        }
+    else:
+        classification_result = {"num_vulnerable_samples": 0}
+
+    return multiclass_result, detection_result, classification_result
 
 
 def save_classifier(args, classifier):
     output_dir = os.path.join(args.output_dir, args.to_checkpoint)
     os.makedirs(output_dir, exist_ok=True)
-    torch.save(classifier.state_dict(), os.path.join(output_dir, 'classifier.bin'))
+    torch.save(classifier.state_dict(), os.path.join(output_dir, "classifier.bin"))
     logger.info("Saved classifier to %s/classifier.bin", output_dir)
 
 
 def save_features(args, split, task, features, labels):
     """Cache extracted features to disk to avoid re-extraction on subsequent runs."""
-    cache_dir = os.path.join(args.output_dir, args.to_checkpoint, 'features')
+    cache_dir = os.path.join(args.output_dir, args.to_checkpoint, "features")
     os.makedirs(cache_dir, exist_ok=True)
-    torch.save(features, os.path.join(cache_dir, f'{split}_{task}_features.pt'))
-    torch.save(labels, os.path.join(cache_dir, f'{split}_{task}_labels.pt'))
+    torch.save(features, os.path.join(cache_dir, f"{split}_{task}_features.pt"))
+    torch.save(labels, os.path.join(cache_dir, f"{split}_{task}_labels.pt"))
     logger.info("Cached %s features to %s", split, cache_dir)
 
 
 def load_features(args, split, task):
     """Load cached features if available."""
-    f_path = os.path.join(args.output_dir, args.to_checkpoint, 'features',
-                          f'{split}_{task}_features.pt')
-    l_path = os.path.join(args.output_dir, args.to_checkpoint, 'features',
-                          f'{split}_{task}_labels.pt')
+    f_path = os.path.join(
+        args.output_dir, args.to_checkpoint, "features", f"{split}_{task}_features.pt"
+    )
+    l_path = os.path.join(
+        args.output_dir, args.to_checkpoint, "features", f"{split}_{task}_labels.pt"
+    )
     if os.path.exists(f_path) and os.path.exists(l_path):
         logger.info("Loading cached %s features from %s", split, f_path)
         return torch.load(f_path), torch.load(l_path)
@@ -140,13 +214,27 @@ def load_features(args, split, task):
 # ---------------------------------------------------------------------------
 # Training loop with early stopping
 # ---------------------------------------------------------------------------
-def train_with_early_stopping(args, classifier, train_features, train_labels,
-                               val_features, val_labels, device, num_classes):
-    """Train linear probe with early stopping on validation F1."""
+def train_with_early_stopping(
+    args,
+    classifier,
+    train_features,
+    train_labels,
+    val_features,
+    val_labels,
+    device,
+    num_classes,
+):
+    """
+    Train linear probe with early stopping on detection F1 (binary collapse of 91-class).
+    Uses detection F1 as the early stopping signal since it reflects both detection
+    and classification quality across all classes.
+    """
     train_ds = torch.utils.data.TensorDataset(train_features, train_labels)
     train_loader = DataLoader(train_ds, batch_size=args.train_batch_size, shuffle=True)
 
-    optimizer = AdamW(classifier.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = AdamW(
+        classifier.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
 
     best_f1, epochs_no_improve, stop = 0.0, 0, False
 
@@ -163,11 +251,19 @@ def train_with_early_stopping(args, classifier, train_features, train_labels,
             total_loss += loss.item()
 
         avg_loss = round(total_loss / len(train_loader), 5)
-        val_results = evaluate_probe(classifier, val_features, val_labels, device, num_classes)
-        val_f1 = val_results['f1']
+        _, val_detect_results, val_class_results = evaluate_unified(
+            classifier, val_features, val_labels, device
+        )
 
-        logger.info("Epoch %d — loss %.5f — val accuracy %.4f — val f1 %.4f",
-                    epoch, avg_loss, val_results['accuracy'], val_f1)
+        # Use detection F1 as early stopping signal
+        val_f1 = val_detect_results["f1"]
+        logger.info(
+            "Epoch %d — loss %.5f — val detection f1 %.4f — val classification f1_weighted %.4f",
+            epoch,
+            avg_loss,
+            val_f1,
+            val_class_results["f1_weighted"],
+        )
 
         if val_f1 > best_f1:
             best_f1 = val_f1
@@ -195,21 +291,32 @@ def main():
     parser.add_argument("--output_dir", default=None, type=str, required=True)
     parser.add_argument("--dataset", default=None, type=str, required=True)
     parser.add_argument("--pretrain_checkpoint", default=None, type=str)
-    parser.add_argument("--from_checkpoint", default=None, type=str,
-                        help="Load a previously saved classifier for evaluation")
-    parser.add_argument("--to_checkpoint", default=None, type=str,
-                        help="Folder to save/load classifier checkpoint")
+    parser.add_argument(
+        "--from_checkpoint",
+        default=None,
+        type=str,
+        help="Load a previously saved classifier for evaluation",
+    )
+    parser.add_argument(
+        "--to_checkpoint",
+        default=None,
+        type=str,
+        help="Folder to save/load classifier checkpoint",
+    )
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
-    parser.add_argument("--pretrain_code_model_name", default="microsoft/codebert-base", type=str)
+    parser.add_argument(
+        "--pretrain_code_model_name", default="microsoft/codebert-base", type=str
+    )
     parser.add_argument("--code_length", default=512, type=int)
     parser.add_argument("--hidden_size", default=768, type=int)
 
-    # Task flags
-    parser.add_argument("--do_train", action='store_true', help="Train linear probe")
-    parser.add_argument("--do_test", action='store_true', help="Evaluate on test set (detection)")
-    parser.add_argument("--do_test_cls", action='store_true', help="Evaluate on test set (classification)")
-    parser.add_argument("--detection", action='store_true', help="Binary detection task")
-    parser.add_argument("--classification", action='store_true', help="10-class classification task")
+    # Unified: single 91-class classifier handles both detection (binary collapse) and classification
+    parser.add_argument("--do_train", action="store_true", help="Train linear probe")
+    parser.add_argument(
+        "--do_test",
+        action="store_true",
+        help="Evaluate on test set (both detection and classification)",
+    )
 
     # Hyperparams
     parser.add_argument("--train_batch_size", default=256, type=int)
@@ -218,9 +325,9 @@ def main():
     parser.add_argument("--weight_decay", default=0.0, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
     parser.add_argument("--num_workers", default=8, type=int)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--patience", type=int, default=5)
 
     args = parser.parse_args()
 
@@ -228,20 +335,24 @@ def main():
     args.n_gpu = torch.cuda.device_count()
     args.device = device
 
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
     logger.warning("device: %s, n_gpu: %s", device, args.n_gpu)
 
     set_seed(args)
 
     from transformers import RobertaTokenizer
+
     code_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_code_model_name)
     text_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_text_model_name)
 
     # Load frozen backbone
     backbone = ContrastiveModel(args)
     if args.pretrain_checkpoint:
-        ckpt_path = os.path.join(args.output_dir, args.pretrain_checkpoint, 'model.bin')
+        ckpt_path = os.path.join(args.output_dir, args.pretrain_checkpoint, "model.bin")
         backbone.load_state_dict(torch.load(ckpt_path))
         logger.info("Loaded backbone from %s", ckpt_path)
     backbone.to(device)
@@ -249,49 +360,63 @@ def main():
         p.requires_grad = False
     backbone.eval()
 
-    # Determine task mode
-    has_cls = args.classification or args.do_test_cls
-    task = 'classification' if has_cls else 'detection'
-    num_classes = 10 if has_cls else 2
-
     # ---------------------------------------------------------------------------
-    # Training + evaluation (combined or separate)
+    # Always use unified CWE labels (0=safe, 1-90=CWE types)
+    # A single 91-class classifier handles both detection and classification.
     # ---------------------------------------------------------------------------
-    # Always determine if we need extraction: train needs val, test needs test
-    needs_train = args.do_train
-    needs_val = args.do_train
-    needs_test = args.do_test or args.do_test_cls
+    num_classes = NUM_CLASSES  # 90
 
+    # Feature extraction and caching (unified, no task branching)
     train_features = val_features = test_features = None
     train_labels = val_labels = test_labels = None
 
     # Try to load cached features first
-    for split, needed in [('train', needs_train), ('val', needs_val), ('test', needs_test)]:
+    for split, needed in [
+        ("train", args.do_train),
+        ("val", args.do_train),
+        ("test", args.do_test),
+    ]:
         if needed:
-            f, lbl = load_features(args, split, task)
+            f, lbl = load_features(args, split, "unified")
             if f is not None:
-                if split == 'train':
+                if split == "train":
                     train_features, train_labels = f, lbl
-                elif split == 'val':
+                elif split == "val":
                     val_features, val_labels = f, lbl
                 else:
                     test_features, test_labels = f, lbl
 
     # Extract missing features
-    if needs_train and train_features is None:
-        loader = build_probe_dataloader(args, code_tokenizer, text_tokenizer, 'train', args.train_batch_size, task)
+    if args.do_train and train_features is None:
+        loader = build_probe_dataloader(
+            args,
+            code_tokenizer,
+            text_tokenizer,
+            "train",
+            args.train_batch_size,
+            "unified",
+        )
         train_features, train_labels = extract_features(backbone, loader, device)
-        save_features(args, 'train', task, train_features, train_labels)
+        save_features(args, "train", "unified", train_features, train_labels)
 
-    if needs_val and val_features is None:
-        loader = build_probe_dataloader(args, code_tokenizer, text_tokenizer, 'val', args.eval_batch_size, task)
+    if args.do_train and val_features is None:
+        loader = build_probe_dataloader(
+            args, code_tokenizer, text_tokenizer, "val", args.eval_batch_size, "unified"
+        )
         val_features, val_labels = extract_features(backbone, loader, device)
-        save_features(args, 'val', task, val_features, val_labels)
+        save_features(args, "val", "unified", val_features, val_labels)
 
-    if needs_test and test_features is None:
-        loader = build_probe_dataloader(args, code_tokenizer, text_tokenizer, 'test', args.eval_batch_size, task)
+    if args.do_test and test_features is None:
+        loader = build_probe_dataloader(
+            args,
+            code_tokenizer,
+            text_tokenizer,
+            "test",
+            args.eval_batch_size,
+            "unified",
+        )
         test_features, test_labels = extract_features(backbone, loader, device)
-        save_features(args, 'test', task, test_features, test_labels)
+        save_features(args, "test", "unified", test_features, test_labels)
 
     # ---------------------------------------------------------------------------
     # Training
@@ -299,60 +424,66 @@ def main():
     if args.do_train:
         classifier = LinearProbe(input_dim=768, num_classes=num_classes)
         if args.from_checkpoint:
-            ckpt_path = os.path.join(args.output_dir, args.from_checkpoint, 'classifier.bin')
+            ckpt_path = os.path.join(
+                args.output_dir, args.from_checkpoint, "classifier.bin"
+            )
             classifier.load_state_dict(torch.load(ckpt_path))
             logger.info("Loaded classifier from %s", ckpt_path)
         classifier.to(device)
 
         best_f1, _ = train_with_early_stopping(
-            args, classifier, train_features, train_labels,
-            val_features, val_labels, device, num_classes
+            args,
+            classifier,
+            train_features,
+            train_labels,
+            val_features,
+            val_labels,
+            device,
+            num_classes,
         )
 
         # If NOT evaluating test afterwards, we're done
-        if not (args.do_test or args.do_test_cls):
+        if not args.do_test:
             return
 
     # ---------------------------------------------------------------------------
-    # Test evaluation
+    # Test evaluation: single 91-class classifier evaluates both detection and classification
     # ---------------------------------------------------------------------------
-    if args.do_test or args.do_test_cls:
-        # Load the saved best classifier (from training, or from explicit --from_checkpoint)
+    if args.do_test:
         classifier = LinearProbe(input_dim=768, num_classes=num_classes)
-        ckpt_path = os.path.join(args.output_dir, args.to_checkpoint, 'classifier.bin')
+        ckpt_path = os.path.join(args.output_dir, args.to_checkpoint, "classifier.bin")
         if os.path.exists(ckpt_path):
             classifier.load_state_dict(torch.load(ckpt_path))
             logger.info("Loaded classifier from %s", ckpt_path)
         else:
-            logger.warning("No classifier checkpoint found at %s — skipping test eval", ckpt_path)
+            logger.warning("No classifier found at %s — skipping test eval", ckpt_path)
             return
         classifier.to(device)
         classifier.eval()
 
-        # Detection eval
-        if args.do_test:
-            det_results = evaluate_probe(classifier, test_features, test_labels, device, num_classes=2)
-            logger.info("***** Test results (detection) *****")
-            for k, v in det_results.items():
-                logger.info("  %s = %s", k, str(round(v, 4)))
-            print("Detection test result:", det_results)
+        multiclass_result, detection_result, classification_result = evaluate_unified(
+            classifier, test_features, test_labels, device
+        )
 
-        # Classification eval (need CWE labels — ClassificationProbeData uses different labels)
-        if args.do_test_cls:
-            # Reload test features with classification labels if not already classification task
-            if task != 'classification':
-                # Need to re-extract with classification labels
-                loader = build_probe_dataloader(args, code_tokenizer, text_tokenizer, 'test',
-                                                 args.eval_batch_size, 'classification')
-                cls_test_features, cls_test_labels = extract_features(backbone, loader, device)
-            else:
-                cls_test_features, cls_test_labels = test_features, test_labels
+        logger.info("***** Test results — num_classes=%d *****", NUM_CLASSES)
+        logger.info("--- Multi-class (all %d classes) ---", NUM_CLASSES)
+        for k, v in multiclass_result.items():
+            logger.info("  %s = %s", k, str(round(v, 4)))
+        print("Multiclass results:", multiclass_result)
 
-            cls_results = evaluate_probe(classifier, cls_test_features, cls_test_labels, device, num_classes=10)
-            logger.info("***** Test results (classification) *****")
-            for k, v in cls_results.items():
-                logger.info("  %s = %s", k, str(round(v, 4)))
-            print("Classification test result:", cls_results)
+        logger.info(
+            "--- Detection (binary: safe vs vulnerable — collapsed from 91 classes) ---"
+        )
+        for k, v in detection_result.items():
+            logger.info("  %s = %s", k, str(round(v, 4)))
+        print("Detection results:", detection_result)
+
+        logger.info(
+            "--- Classification (CWE types — vulnerable ground-truth samples only) ---"
+        )
+        for k, v in classification_result.items():
+            logger.info("  %s = %s", k, str(round(v, 4)))
+        print("Classification results:", classification_result)
 
     logger.info("Done.")
 
