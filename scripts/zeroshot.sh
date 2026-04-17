@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 
 PYTHONPATH=src:$PYTHONPATH uv run python src/zeroshot.py \
     --from_pretrain_checkpoint=saved_models/pretrain_vul_model.bin \
+    --dataset=vcldata \
     --pretrain_code_model_name=microsoft/codebert-base \
     --pretrain_text_model_name=roberta-base \
     --code_length 512 \

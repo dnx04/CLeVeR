@@ -328,6 +328,7 @@ def main():
         required=True,
         help="Path to the pretrained model checkpoint to evaluate",
     )
+    parser.add_argument("--dataset", default="vcldata", type=str)
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
     parser.add_argument(
         "--pretrain_code_model_name", default="microsoft/codebert-base", type=str
@@ -343,6 +344,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
     args.device = device
+    args.code_length = args.code_length
+    args.hidden_size = args.hidden_size
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
