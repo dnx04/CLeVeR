@@ -32,11 +32,10 @@ def get_cwe_description(cwe_id):
     return f"A vulnerability of CWE-{cwe_id}."
 
 
-# Unified description list for zero-shot: index 0 = safe, index 1 = unlabeled vuln, index 2+ = CWE types
+# Unified description list for zero-shot: index 0 = safe, index 1+ = CWE types
 SAFE_DESCRIPTION = "This is a secure function with no vulnerability."
-UNLABELED_VULN_DESCRIPTION = "A vulnerable function with no specific CWE classification."
 UNIFIED_DESCS = (
-    [SAFE_DESCRIPTION, UNLABELED_VULN_DESCRIPTION]
+    [SAFE_DESCRIPTION]
     + [get_cwe_description(cwe) for cwe in CWE_LIST]
 )
 
@@ -49,15 +48,12 @@ def _load_examples(args, flag):
 
     if "pretrain" not in flag:
         # Keep: safe (cwe_id=None/"None", label=0) OR
-        #        unlabeled vuln (cwe_id="None", label=1) OR
         #        specific CWE (cwe_id in CWE2INT)
         def keep_example(ex):
             cwe_str = str(ex.cwe_id)
             lbl = int(ex.label)
             if is_safe_cwe(ex.cwe_id) or lbl == 0:
                 return True  # safe
-            if cwe_str == "None" and lbl == 1:
-                return True  # unlabeled vuln
             return cwe_str in CWE2INT  # specific CWE
 
         examples = [ex for ex in examples if keep_example(ex)]
@@ -138,8 +134,7 @@ class UnifiedData(Dataset):
 
     Class index layout (NUM_CLASSES total):
       0  : safe (cwe_id=None/"None", label=0)
-      1  : unlabeled vuln (cwe_id="None", label=1)
-      2+ : specific CWE types (cwe_id in CWE2INT)
+      1+ : specific CWE types (cwe_id in CWE2INT)
     """
 
     def __init__(self, code_tokenizer, text_tokenizer, args, flag=""):
@@ -158,9 +153,7 @@ class UnifiedData(Dataset):
         label = int(self.examples[item].label)
         cwe_str = str(cwe_id)
 
-        if cwe_str == "None" and label == 1:
-            unified_label = 1
-        elif is_safe_cwe(cwe_id) or label == 0:
+        if is_safe_cwe(cwe_id) or label == 0:
             unified_label = 0
         else:
             unified_label = CWE2INT.get(cwe_str, 0)

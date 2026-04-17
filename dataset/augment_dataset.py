@@ -1,13 +1,11 @@
 """
 Reason and CWE augmentation for vcldata.pkl via LLM.
 
-Rules:
-  1. Unlabeled vuln (cwe_id="None", label=1) → LLM generates BOTH reason AND CWE ID
-  2. Labeled vuln (specific CWE, label=1, sim < threshold) → LLM augments reason only
-  3. Safe (label=0) → untouched
+Only processes unlabeled vulnerable samples (cwe_id="None", label=1).
+LLM generates BOTH reason AND CWE ID → updates description AND cwe_id.
 
 Usage:
-    uv run python dataset/augment_dataset.py [--sim-threshold 0.4] [--dry-run] [--no-llm]
+    uv run python dataset/augment_dataset.py [--dry-run] [--no-llm]
 """
 
 import pickle
@@ -18,64 +16,19 @@ import json
 import argparse
 import sys
 
-import torch
-from transformers import AutoTokenizer, AutoModel
-from tqdm import tqdm
 from openai import OpenAI
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 load_dotenv(".env.local")
 
 API_KEY = os.environ.get("FPTAI_API_KEY", "")
 BASE_URL = "https://mkp-api.fptcloud.com/v1"
 MODEL = "gemma-4-31B-it"
-MAX_TOKENS = 64
+MAX_TOKENS = 128
 MAX_RETRIES = 3
 CONCURRENCY = 16
-SIM_THRESHOLD = 0.4
-
-_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
-if _src_dir not in sys.path:
-    sys.path.insert(0, _src_dir)
-
-
-# -------------------------------------------------------------------------
-# UniXcoder
-# -------------------------------------------------------------------------
-
-_model_cache = {}
-
-
-def get_model():
-    if "model" not in _model_cache:
-        model_name = "microsoft/unixcoder-base"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        model.eval()
-        _model_cache["model"] = (model, tokenizer, device)
-    return _model_cache["model"]
-
-
-def encode_batch(texts, max_length=512, batch_size=64):
-    model, tokenizer, device = get_model()
-    embeddings = []
-    for i in tqdm(range(0, len(texts), batch_size), desc="Encoding"):
-        batch = texts[i:i + batch_size]
-        tokens = tokenizer(
-            batch, return_tensors="pt", padding=True, truncation=True, max_length=max_length
-        ).to(device)
-        with torch.no_grad():
-            emb = model(**tokens).last_hidden_state[:, 0, :]
-        emb = emb / emb.norm(dim=-1, keepdim=True)
-        embeddings.append(emb.cpu())
-    return torch.cat(embeddings, dim=0)
-
-
-def get_field(ex, name, default=""):
-    return getattr(ex, name, ex.get(name, default) if hasattr(ex, "get") else default)
 
 
 # -------------------------------------------------------------------------
@@ -85,25 +38,14 @@ def get_field(ex, name, default=""):
 def build_unlabeled_prompt(code_snippet):
     return (
         "You are a vulnerability analysis assistant. Analyze the following code snippet "
-        "from an unlabeled vulnerability sample (vulnerable but no specific CWE type identified). "
-        "Generate a SINGLE concise sentence describing the specific vulnerability mechanism. "
-        "IMPORTANT: Your output MUST include the correct CWE ID (e.g. CWE-78, CWE-121). "
-        "Focus on the concrete unsafe operation observed.\n\n"
+        "(vulnerable but no specific CWE type identified). "
+        "Identify the vulnerability SOURCE (where tainted data enters), "
+        "the SINK (where unsafe operation occurs), and the MECHANISM (how the vulnerability occurs). "
+        "Output format: \"CWE-ID: xxx | SOURCE: ... | SINK: ... | MECHANISM: <short sentence>\" "
+        "Use numeric CWE-ID only (e.g. 78, 121, no CWE- prefix). "
+        "SOURCE and SINK must be only variable/function names (e.g. getenv, strlen, data, buf). Be concise.\n\n"
         f"Code:\n{code_snippet}\n\n"
-        "Output ONLY ONE sentence that includes the CWE ID:"
-    )
-
-
-def build_labeled_prompt(cwe_id, cwe_name, code_snippet, source, sink):
-    return (
-        "You are a vulnerability analysis assistant. Given the following code snippet, "
-        "generate a SINGLE concise sentence describing the specific vulnerability mechanism. "
-        "Focus on the concrete unsafe operation.\n\n"
-        f"CWE-{cwe_id} ({cwe_name}):\n"
-        f"Code:\n{code_snippet}\n"
-        f"Source: {source}\n"
-        f"Sink: {sink}\n\n"
-        "Output ONLY ONE sentence:"
+        "Output:"
     )
 
 
@@ -123,21 +65,34 @@ def call_gemma(client, prompt, max_retries=MAX_RETRIES):
     return None
 
 
-CWE_ID_PATTERN = re.compile(r'CWE-(\d+)', re.IGNORECASE)
+CWE_ID_PATTERN = re.compile(r'(?:CWE[- ]ID[:\s]*)?(\d+)(?:\s+\|)', re.IGNORECASE)
+SOURCE_PATTERN = re.compile(r'SOURCE:\s*([^|]+)', re.IGNORECASE)
+SINK_PATTERN = re.compile(r'SINK:\s*([^|]+)', re.IGNORECASE)
+MECHANISM_PATTERN = re.compile(r'MECHANISM:\s*(.+)', re.IGNORECASE)
+
+
+def parse_llm_output(result):
+    """Parse LLM output into (cwe_id, source, sink, mechanism)."""
+    if not result:
+        return None, None, None, None
+
+    cwe_match = CWE_ID_PATTERN.search(result)
+    source_match = SOURCE_PATTERN.search(result)
+    sink_match = SINK_PATTERN.search(result)
+    mech_match = MECHANISM_PATTERN.search(result)
+
+    cwe_id = cwe_match.group(1) if cwe_match else None
+    source = source_match.group(1).strip() if source_match else None
+    sink = sink_match.group(1).strip() if sink_match else None
+    mechanism = mech_match.group(1).strip().rstrip(".") if mech_match else None
+
+    return cwe_id, source, sink, mechanism
 
 
 def clean_result(result):
     if not result:
         return None
-    clean = result.strip().strip('"').strip("'").strip(".")
-    if not clean.endswith("."):
-        clean += "."
-    return clean
-
-
-def extract_cwe_id(text):
-    m = CWE_ID_PATTERN.search(text)
-    return m.group(1) if m else None
+    return result.strip().strip('"').strip("'").strip(".")
 
 
 # -------------------------------------------------------------------------
@@ -146,11 +101,8 @@ def extract_cwe_id(text):
 
 def main():
     parser = argparse.ArgumentParser(description="Augment vcldata.pkl via LLM")
-    parser.add_argument("--sim-threshold", type=float, default=SIM_THRESHOLD,
-                        help=f"Similarity threshold for labeled vuln (default: {SIM_THRESHOLD})")
     parser.add_argument("--dry-run", action="store_true", help="Print changes without saving")
     parser.add_argument("--no-llm", action="store_true", help="Skip LLM rewriting")
-    parser.add_argument("--batch-size", type=int, default=64, help="UniXcoder batch size")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
                         help=f"LLM concurrent calls (default: {CONCURRENCY})")
     args = parser.parse_args()
@@ -162,52 +114,20 @@ def main():
         data = pickle.load(f)
     print(f"  Total samples: {len(data)}\n")
 
-    cwe_names = json.load(open("src/cwe_names.json"))
-
     # -------------------------------------------------------------------------
-    # Categorize samples
+    # Find unlabeled vulnerable samples
     # -------------------------------------------------------------------------
     unlabeled_vuln = []
-    labeled_vuln_below = []
-    labeled_vuln_above = []
-
-    # Compute similarities for labeled vuln samples
-    print("Computing similarities for labeled vuln samples...")
-    labeled_indices = []
-    labeled_codes = []
-    labeled_reasons = []
     for idx, ex in enumerate(data):
-        cwe_id = str(get_field(ex, "cwe_id", "None"))
-        label = str(get_field(ex, "label", "0"))
-        if label == "1" and cwe_id != "None":
-            labeled_indices.append(idx)
-            labeled_codes.append(get_field(ex, "func", ""))
-            labeled_reasons.append(get_field(ex, "description", ""))
-
-    if labeled_codes:
-        code_embs = encode_batch(labeled_codes, batch_size=args.batch_size)
-        desc_embs = encode_batch(labeled_reasons, batch_size=args.batch_size)
-        sims = ((code_embs * desc_embs).sum(dim=-1)).tolist()
-
-        for idx, sim in zip(labeled_indices, sims):
-            if sim < args.sim_threshold:
-                labeled_vuln_below.append(idx)
-            else:
-                labeled_vuln_above.append(idx)
-
-    # Unlabeled vuln
-    for idx, ex in enumerate(data):
-        cwe_id = str(get_field(ex, "cwe_id", "None"))
-        label = str(get_field(ex, "label", "0"))
+        cwe_id = str(getattr(ex, "cwe_id", "None"))
+        label = str(getattr(ex, "label", "0"))
         if label == "1" and cwe_id == "None":
             unlabeled_vuln.append(idx)
 
     print(f"  Unlabeled vuln (label=1, cwe_id=None): {len(unlabeled_vuln)}")
-    print(f"  Labeled vuln below threshold (< {args.sim_threshold}): {len(labeled_vuln_below)}")
-    print(f"  Labeled vuln above threshold (>= {args.sim_threshold}): {len(labeled_vuln_above)}")
-    print(f"  Safe (label=0): {sum(1 for ex in data if str(get_field(ex, 'label', '0')) == '0')}")
+    print(f"  Safe (label=0): {sum(1 for ex in data if str(getattr(ex, 'label', '0')) == '0')}")
 
-    to_process = unlabeled_vuln + labeled_vuln_below
+    to_process = unlabeled_vuln
     print(f"\nTotal samples to process via LLM: {len(to_process)}")
 
     llm_client = None
@@ -230,26 +150,9 @@ def main():
     all_tasks = []
     for idx in to_process:
         ex = data[idx]
-        cwe_id = str(get_field(ex, "cwe_id", "None"))
-        label = str(get_field(ex, "label", "0"))
-        is_unlabeled = cwe_id == "None" and label == "1"
-        reason = get_field(ex, "description", "")
-
-        if is_unlabeled:
-            cwe_name = "unlabeled"
-            prompt = build_unlabeled_prompt(get_field(ex, "func", ""))
-            task_type = "unlabeled"
-        else:
-            cwe_name = cwe_names.get(cwe_id, f"CWE-{cwe_id}")
-            prompt = build_labeled_prompt(
-                cwe_id, cwe_name,
-                get_field(ex, "func", ""),
-                get_field(ex, "source", ""),
-                get_field(ex, "sink", ""),
-            )
-            task_type = "labeled"
-
-        all_tasks.append((idx, task_type, cwe_id, cwe_name, reason, prompt))
+        func = getattr(ex, "func", "")
+        prompt = build_unlabeled_prompt(func)
+        all_tasks.append((idx, func, prompt))
 
     # -------------------------------------------------------------------------
     # LLM processing
@@ -260,44 +163,44 @@ def main():
     changes = []
 
     def process_task(task):
-        idx, task_type, cwe_id, cwe_name, old_reason, prompt = task
-        # NOTE: cwe_id is locally captured here to avoid closure over loop var
-        orig_cwe_id = cwe_id
+        idx, func, prompt = task
         client = llm_client
         result = call_gemma(client, prompt)
         if not result:
-            return idx, task_type, old_reason, old_reason, orig_cwe_id, "failed"
+            return idx, None, None, None, None, "failed"
 
-        if task_type == "unlabeled":
-            new_cwe = extract_cwe_id(result)
-            if new_cwe:
-                return idx, task_type, old_reason, clean_result(result), new_cwe, "cwe_and_reason"
+        cwe_id, source, sink, mechanism = parse_llm_output(result)
+        if not cwe_id:
             # retry with emphasis
-            result2 = call_gemma(client, prompt + "\n\nYou MUST include a valid CWE ID.")
+            result2 = call_gemma(client, prompt + "\n\nYou MUST include a valid CWE-ID.")
             if result2:
-                new_cwe = extract_cwe_id(result2)
-                if new_cwe:
-                    return idx, task_type, old_reason, clean_result(result2), new_cwe, "cwe_and_reason"
-            return idx, task_type, old_reason, old_reason, orig_cwe_id, "failed"
-        else:
-            return idx, task_type, old_reason, clean_result(result), orig_cwe_id, "reason_only"
+                cwe_id, source, sink, mechanism = parse_llm_output(result2)
+
+        if cwe_id and source and sink and mechanism:
+            description = f"SOURCE: {source} | SINK: {sink} | MECHANISM: {mechanism}."
+            return idx, description, cwe_id, source, sink, "success"
+        return idx, None, None, None, None, "failed"
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {executor.submit(process_task, t): t for t in all_tasks}
         pbar = tqdm(total=len(all_tasks), unit="sample", desc="LLM")
 
         for future in as_completed(futures):
-            idx, task_type, old_reason, new_reason, new_cwe, status = future.result()
+            idx, new_reason, new_cwe, source, sink, status = future.result()
             total_calls += 1
             if status == "failed":
                 fail += 1
             else:
                 success += 1
-                changes.append((idx, task_type, old_reason, new_reason, new_cwe))
+                old_reason = getattr(data[idx], "description", "")
+                old_cwe = getattr(data[idx], "cwe_id", "None")
+                changes.append((idx, old_reason, new_reason, old_cwe, new_cwe))
                 if not args.dry_run:
                     setattr(data[idx], "description", new_reason)
-                    if new_cwe != cwe_id and task_type == "unlabeled":
-                        setattr(data[idx], "cwe_id", new_cwe)
+                    setattr(data[idx], "cwe_id", new_cwe)
+                    setattr(data[idx], "source", source)
+                    setattr(data[idx], "sink", sink)
+            pbar.set_postfix(success=success, fail=fail)
             pbar.update(1)
             if total_calls % 200 == 0:
                 print(f"\n  ({total_calls} calls, rate={total_calls / (time.time() - t0):.1f}/sec)")
@@ -310,16 +213,14 @@ def main():
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
     print(f"LLM: success={success}, failed={fail}")
-    print(f"  unlabeled (reason+cwe): {sum(1 for c in changes if c[1] == 'unlabeled')}")
-    print(f"  labeled (reason only):  {sum(1 for c in changes if c[1] == 'labeled')}")
     print(f"Total time: {elapsed:.1f}s")
 
     if args.dry_run:
         print("\nDRY RUN — no changes saved")
         print(f"\n{len(changes)} samples would be modified:")
-        for idx, task_type, old_reason, new_reason, new_cwe in changes[:20]:
-            cwe_change = f" (cwe: {get_field(data[idx], 'cwe_id', 'None')} -> {new_cwe})" if task_type == "unlabeled" else ""
-            print(f"  [{task_type}]{cwe_change} \"{old_reason}\" -> \"{new_reason}\"")
+        for idx, old_reason, new_reason, old_cwe, new_cwe in changes[:20]:
+            print(f"  [{idx}] cwe: {old_cwe} -> {new_cwe}")
+            print(f"       reason: \"{old_reason}\" -> \"{new_reason}\"")
         if len(changes) > 20:
             print(f"  ... and {len(changes) - 20} more")
     else:

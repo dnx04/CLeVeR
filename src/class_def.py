@@ -18,8 +18,7 @@ CWE_FREQUENCY_THRESHOLD = 50  # minimum samples to include a CWE class
 # ---------------------------------------------------------------------------
 # Class index layout
 #   0          : safe (cwe_id=None or cwe_id="None", label=0)
-#   1          : vulnerable but not CWE-labeled (cwe_id="None", label=1)
-#   2 .. N     : specific CWE types (CWE_LIST[i] -> class i+2)
+#   1 .. N     : specific CWE types (CWE_LIST[i] -> class i+1)
 # ---------------------------------------------------------------------------
 
 def build_cwe_mapping():
@@ -42,15 +41,15 @@ def build_cwe_mapping():
             if cnt >= CWE_FREQUENCY_THRESHOLD and cwe != "None"
         ]
     )
-    # CWE index 0 = safe, index 1 = unlabeled vuln, index 2+ = specific CWE
-    cwe2int = {cwe: idx + 2 for idx, cwe in enumerate(valid_cwes)}
+    # CWE index 0 = safe, index 1+ = specific CWE
+    cwe2int = {cwe: idx + 1 for idx, cwe in enumerate(valid_cwes)}
     return valid_cwes, cwe2int
 
 
 # Build mapping at import time
 CWE_LIST, CWE2INT = build_cwe_mapping()
 
-# Total classes: safe(0) + unlabeled vuln(1) + specific CWE types
-NUM_CLASSES = len(CWE_LIST) + 2
+# Total classes: safe(0) + specific CWE types
+NUM_CLASSES = len(CWE_LIST) + 1
 
-print(f"[class.py] Loaded {NUM_CLASSES} classes: 1 safe + 1 unlabeled + {len(CWE_LIST)} CWE types")
+print(f"[class.py] Loaded {NUM_CLASSES} classes: 1 safe + {len(CWE_LIST)} CWE types")
