@@ -31,15 +31,12 @@ def set_seed(args):
 # DataLoader builders
 # ---------------------------------------------------------------------------
 def build_probe_dataloader(
-    args, code_tokenizer, text_tokenizer, flag, batch_size, task
+    args, code_tokenizer, text_tokenizer, flag, batch_size
 ):
-    """Build a DataLoader for probe data.
-    task: 'detection' (binary) or 'classification' (unified CWE)
-    Both use ClassificationProbeData which returns unified CWE labels (0=safe, 1-90=CWE).
-    """
-    from data import ClassificationProbeData
+    """Build a DataLoader for probe data using UnifiedData."""
+    from data import UnifiedData
 
-    dataset = ClassificationProbeData(code_tokenizer, text_tokenizer, args, flag=flag)
+    dataset = UnifiedData(code_tokenizer, text_tokenizer, args, flag=flag)
 
     sampler = (
         SequentialSampler(dataset)
@@ -79,7 +76,9 @@ def extract_features(model, dataloader, device):
     model.eval()
     features, labels = [], []
     for batch in tqdm(dataloader, desc="Extracting features"):
-        func_input_ids, func_attention_mask, label = [x.to(device) for x in batch]
+        # UnifiedData returns (func_ids, func_mask, desc_ids_list, desc_mask_list, label)
+        # Linear probe only uses func_ids, func_mask, label (desc fields are ignored)
+        func_input_ids, func_attention_mask, _, _, label = [x.to(device) for x in batch]
         code_repr = encode_code_batch(
             model, func_input_ids, func_attention_mask, device
         )
@@ -181,30 +180,24 @@ def evaluate_unified(classifier, features, labels, device):
     return multiclass_result, detection_result, classification_result
 
 
-def save_classifier(args, classifier):
-    output_dir = os.path.join(args.output_dir, args.to_checkpoint)
-    os.makedirs(output_dir, exist_ok=True)
-    torch.save(classifier.state_dict(), os.path.join(output_dir, "classifier.bin"))
-    logger.info("Saved classifier to %s/classifier.bin", output_dir)
+def save_classifier(checkpoint_path, classifier):
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    torch.save(classifier.state_dict(), checkpoint_path)
+    logger.info("Saved classifier to %s", checkpoint_path)
 
 
-def save_features(args, split, task, features, labels):
+def save_features(cache_dir, split, task, features, labels):
     """Cache extracted features to disk to avoid re-extraction on subsequent runs."""
-    cache_dir = os.path.join(args.output_dir, args.to_checkpoint, "features")
     os.makedirs(cache_dir, exist_ok=True)
     torch.save(features, os.path.join(cache_dir, f"{split}_{task}_features.pt"))
     torch.save(labels, os.path.join(cache_dir, f"{split}_{task}_labels.pt"))
     logger.info("Cached %s features to %s", split, cache_dir)
 
 
-def load_features(args, split, task):
+def load_features(cache_dir, split, task):
     """Load cached features if available."""
-    f_path = os.path.join(
-        args.output_dir, args.to_checkpoint, "features", f"{split}_{task}_features.pt"
-    )
-    l_path = os.path.join(
-        args.output_dir, args.to_checkpoint, "features", f"{split}_{task}_labels.pt"
-    )
+    f_path = os.path.join(cache_dir, f"{split}_{task}_features.pt")
+    l_path = os.path.join(cache_dir, f"{split}_{task}_labels.pt")
     if os.path.exists(f_path) and os.path.exists(l_path):
         logger.info("Loading cached %s features from %s", split, f_path)
         return torch.load(f_path), torch.load(l_path)
@@ -223,6 +216,7 @@ def train_with_early_stopping(
     val_labels,
     device,
     num_classes,
+    linprobe_checkpoint_path,
 ):
     """
     Train linear probe with early stopping on detection F1 (binary collapse of 91-class).
@@ -237,6 +231,7 @@ def train_with_early_stopping(
     )
 
     best_f1, epochs_no_improve, stop = 0.0, 0, False
+    best_classifier_path = linprobe_checkpoint_path
 
     for epoch in range(args.epochs):
         classifier.train()
@@ -269,7 +264,7 @@ def train_with_early_stopping(
             best_f1 = val_f1
             epochs_no_improve = 0
             logger.info("  Best val F1: %s — saving checkpoint", round(best_f1, 4))
-            save_classifier(args, classifier)
+            save_classifier(best_classifier_path, classifier)
         else:
             epochs_no_improve += 1
             logger.info("  No improvement (%d/%d)", epochs_no_improve, args.patience)
@@ -288,20 +283,25 @@ def train_with_early_stopping(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--output_dir", default=None, type=str, required=True)
     parser.add_argument("--dataset", default=None, type=str, required=True)
-    parser.add_argument("--pretrain_checkpoint", default=None, type=str)
     parser.add_argument(
-        "--from_checkpoint",
+        "--from_pretrain_checkpoint",
         default=None,
         type=str,
-        help="Load a previously saved classifier for evaluation",
+        required=True,
+        help="Path to the pretrained model checkpoint to load",
     )
     parser.add_argument(
-        "--to_checkpoint",
+        "--to_linprobe_checkpoint",
         default=None,
         type=str,
-        help="Folder to save/load classifier checkpoint",
+        help="Path to save the trained linear probe checkpoint",
+    )
+    parser.add_argument(
+        "--eval_linprobe_checkpoint",
+        default=None,
+        type=str,
+        help="Path to the linear probe checkpoint to evaluate",
     )
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
     parser.add_argument(
@@ -309,14 +309,6 @@ def main():
     )
     parser.add_argument("--code_length", default=512, type=int)
     parser.add_argument("--hidden_size", default=768, type=int)
-
-    # Unified: single 91-class classifier handles both detection (binary collapse) and classification
-    parser.add_argument("--do_train", action="store_true", help="Train linear probe")
-    parser.add_argument(
-        "--do_test",
-        action="store_true",
-        help="Evaluate on test set (both detection and classification)",
-    )
 
     # Hyperparams
     parser.add_argument("--train_batch_size", default=256, type=int)
@@ -349,12 +341,11 @@ def main():
     code_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_code_model_name)
     text_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_text_model_name)
 
-    # Load frozen backbone
+    # Load frozen pretrained backbone
     backbone = ContrastiveModel(args)
-    if args.pretrain_checkpoint:
-        ckpt_path = os.path.join(args.output_dir, args.pretrain_checkpoint, "model.bin")
-        backbone.load_state_dict(torch.load(ckpt_path))
-        logger.info("Loaded backbone from %s", ckpt_path)
+    pretrain_ckpt_path = args.from_pretrain_checkpoint
+    backbone.load_state_dict(torch.load(pretrain_ckpt_path))
+    logger.info("Loaded pretrained backbone from %s", pretrain_ckpt_path)
     backbone.to(device)
     for p in backbone.parameters():
         p.requires_grad = False
@@ -366,69 +357,76 @@ def main():
     # ---------------------------------------------------------------------------
     num_classes = NUM_CLASSES  # 90
 
-    # Feature extraction and caching (unified, no task branching)
+    # Determine what to do
+    do_train = args.to_linprobe_checkpoint is not None
+    do_eval = args.eval_linprobe_checkpoint is not None
+
+    # Feature extraction and caching: use .cache subdirectory next to checkpoint file
+    if do_train:
+        linprobe_cache_dir = args.to_linprobe_checkpoint + ".cache"
+    elif do_eval:
+        linprobe_cache_dir = args.eval_linprobe_checkpoint + ".cache"
+    else:
+        linprobe_cache_dir = None
+
     train_features = val_features = test_features = None
     train_labels = val_labels = test_labels = None
 
     # Try to load cached features first
-    for split, needed in [
-        ("train", args.do_train),
-        ("val", args.do_train),
-        ("test", args.do_test),
-    ]:
-        if needed:
-            f, lbl = load_features(args, split, "unified")
-            if f is not None:
-                if split == "train":
-                    train_features, train_labels = f, lbl
-                elif split == "val":
-                    val_features, val_labels = f, lbl
-                else:
-                    test_features, test_labels = f, lbl
+    if linprobe_cache_dir:
+        for split, needed in [
+            ("train", do_train),
+            ("val", do_train),
+            ("test", do_eval),
+        ]:
+            if needed:
+                f, lbl = load_features(linprobe_cache_dir, split, "unified")
+                if f is not None:
+                    if split == "train":
+                        train_features, train_labels = f, lbl
+                    elif split == "val":
+                        val_features, val_labels = f, lbl
+                    else:
+                        test_features, test_labels = f, lbl
 
     # Extract missing features
-    if args.do_train and train_features is None:
+    if do_train and train_features is None:
         loader = build_probe_dataloader(
             args,
             code_tokenizer,
             text_tokenizer,
             "train",
             args.train_batch_size,
-            "unified",
         )
         train_features, train_labels = extract_features(backbone, loader, device)
-        save_features(args, "train", "unified", train_features, train_labels)
+        if linprobe_cache_dir:
+            save_features(linprobe_cache_dir, "train", "unified", train_features, train_labels)
 
-    if args.do_train and val_features is None:
+    if do_train and val_features is None:
         loader = build_probe_dataloader(
-            args, code_tokenizer, text_tokenizer, "val", args.eval_batch_size, "unified"
+            args, code_tokenizer, text_tokenizer, "val", args.eval_batch_size
         )
         val_features, val_labels = extract_features(backbone, loader, device)
-        save_features(args, "val", "unified", val_features, val_labels)
+        if linprobe_cache_dir:
+            save_features(linprobe_cache_dir, "val", "unified", val_features, val_labels)
 
-    if args.do_test and test_features is None:
+    if do_eval and test_features is None:
         loader = build_probe_dataloader(
             args,
             code_tokenizer,
             text_tokenizer,
             "test",
             args.eval_batch_size,
-            "unified",
         )
         test_features, test_labels = extract_features(backbone, loader, device)
-        save_features(args, "test", "unified", test_features, test_labels)
+        if linprobe_cache_dir:
+            save_features(linprobe_cache_dir, "test", "unified", test_features, test_labels)
 
     # ---------------------------------------------------------------------------
     # Training
     # ---------------------------------------------------------------------------
-    if args.do_train:
+    if do_train:
         classifier = LinearProbe(input_dim=768, num_classes=num_classes)
-        if args.from_checkpoint:
-            ckpt_path = os.path.join(
-                args.output_dir, args.from_checkpoint, "classifier.bin"
-            )
-            classifier.load_state_dict(torch.load(ckpt_path))
-            logger.info("Loaded classifier from %s", ckpt_path)
         classifier.to(device)
 
         best_f1, _ = train_with_early_stopping(
@@ -440,23 +438,29 @@ def main():
             val_labels,
             device,
             num_classes,
+            args.to_linprobe_checkpoint,
         )
 
-        # If NOT evaluating test afterwards, we're done
-        if not args.do_test:
+        # If NOT evaluating afterwards, we're done
+        if not do_eval:
             return
 
     # ---------------------------------------------------------------------------
-    # Test evaluation: single 91-class classifier evaluates both detection and classification
+    # Evaluation: single 91-class classifier evaluates both detection and classification
     # ---------------------------------------------------------------------------
-    if args.do_test:
+    if do_eval:
         classifier = LinearProbe(input_dim=768, num_classes=num_classes)
-        ckpt_path = os.path.join(args.output_dir, args.to_checkpoint, "classifier.bin")
+        # If we just trained, evaluate the best checkpoint we saved
+        # Otherwise, load from eval_linprobe_checkpoint
+        if do_train:
+            ckpt_path = args.to_linprobe_checkpoint
+        else:
+            ckpt_path = args.eval_linprobe_checkpoint
         if os.path.exists(ckpt_path):
             classifier.load_state_dict(torch.load(ckpt_path))
             logger.info("Loaded classifier from %s", ckpt_path)
         else:
-            logger.warning("No classifier found at %s — skipping test eval", ckpt_path)
+            logger.warning("No classifier found at %s — skipping evaluation", ckpt_path)
             return
         classifier.to(device)
         classifier.eval()

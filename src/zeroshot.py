@@ -1,5 +1,5 @@
 # coding=utf-8
-"""CLeVeR zero-shot evaluation — detection and classification in a single pass per sample."""
+"""CLeVeR zero-shot evaluation — unified detection and classification in a single pass per sample."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -93,7 +93,7 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
       - Detection F1: binary F1 (collapse to safe=0, vulnerable=1)
       - Classification F1: CWE-type F1 only on vulnerable ground-truth samples
     """
-    from data import UnifiedTestData
+    from data import UnifiedData
 
     # ---------------------------------------------------------------------------
     # 1. Pre-encode all unified description embeddings (done once)
@@ -102,9 +102,9 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     # all_desc_embeddings shape: (NUM_CLASSES, hidden)
 
     # ---------------------------------------------------------------------------
-    # 2. Load test data using UnifiedTestData (unified CWE label: 0=safe, 1-90=CWE)
+    # 2. Load test data using UnifiedData (unified CWE label: 0=safe, 1-90=CWE)
     # ---------------------------------------------------------------------------
-    test_dataset = UnifiedTestData(code_tokenizer, text_tokenizer, args, flag=flag)
+    test_dataset = UnifiedData(code_tokenizer, text_tokenizer, args, flag=flag)
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(
         test_dataset,
@@ -242,6 +242,11 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     for key in sorted(classification_result.keys()):
         logger.info("  %s = %s", key, str(round(classification_result[key], 4)))
 
+    # Always print all results (unified evaluation gives all metrics at once)
+    print("Multiclass results:", multiclass_result)
+    print("Detection results:", detection_result)
+    print("Classification results:", classification_result)
+
     return {
         "multiclass": multiclass_result,
         "detection": detection_result,
@@ -252,15 +257,13 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--output_dir", default=None, type=str, required=True)
-    parser.add_argument("--dataset", default=None, type=str, required=True)
     parser.add_argument(
-        "--from_checkpoint",
+        "--from_pretrain_checkpoint",
         default=None,
         type=str,
-        help="Pre-trained model checkpoint to load",
+        required=True,
+        help="Path to the pretrained model checkpoint to evaluate",
     )
-    parser.add_argument("--to_checkpoint", default=None, type=str)
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
     parser.add_argument(
         "--pretrain_code_model_name", default="microsoft/codebert-base", type=str
@@ -270,12 +273,6 @@ def main():
     parser.add_argument("--eval_batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--do_test", action="store_true", help="Run zero-shot detection"
-    )
-    parser.add_argument(
-        "--do_test_cls", action="store_true", help="Run zero-shot classification"
-    )
 
     args = parser.parse_args()
 
@@ -296,23 +293,13 @@ def main():
     text_tokenizer = RobertaTokenizer.from_pretrained(args.pretrain_text_model_name)
 
     model = ContrastiveModel(args)
-    if args.from_checkpoint:
-        ckpt_path = os.path.join(args.output_dir, args.from_checkpoint, "model.bin")
-        model.load_state_dict(torch.load(ckpt_path))
-        logger.info("Loaded model from %s", ckpt_path)
+    pretrain_ckpt_path = args.from_pretrain_checkpoint
+    model.load_state_dict(torch.load(pretrain_ckpt_path))
+    logger.info("Loaded pretrained model from %s", pretrain_ckpt_path)
     model.to(device)
 
     # Unified evaluation: both tasks in one pass
     results = evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test")
-
-    if args.do_test:
-        print("Detection results:", results["detection"])
-    if args.do_test_cls:
-        print("Classification results:", results["classification"])
-    # Always print all results (unified evaluation gives all metrics at once)
-    print("Multiclass results:", results["multiclass"])
-    print("Detection results:", results["detection"])
-    print("Classification results:", results["classification"])
 
     return results
 

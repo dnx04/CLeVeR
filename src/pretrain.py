@@ -141,26 +141,25 @@ def train(args, train_dataset, model, code_tokenizer, text_tokenizer):
 
     # Save final checkpoint
     logger.info("Training complete — saving checkpoint...")
-    checkpoint_dir = os.path.join(args.output_dir, args.to_checkpoint)
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
+    checkpoint_path = args.save_checkpoint
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
     model_to_save = model.module if hasattr(model, "module") else model
-    code_encoder = cast(ContrastiveModel, model_to_save).code_encoder
-    text_encoder = cast(ContrastiveModel, model_to_save).desc_encoder
-    code_encoder.encoder.save_pretrained(os.path.join(checkpoint_dir, "code_encoder"))
-    text_encoder.encoder.save_pretrained(os.path.join(checkpoint_dir, "text_encoder"))
-    torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, "model.bin"))
-    logger.info("Saved checkpoint to %s", checkpoint_dir)
+    torch.save(model_to_save.state_dict(), checkpoint_path)
+    logger.info("Saved checkpoint to %s", checkpoint_path)
 
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--output_dir", default=None, type=str, required=True)
     parser.add_argument("--dataset", default=None, type=str, required=True)
-    parser.add_argument("--from_checkpoint", default=None, type=str)
-    parser.add_argument("--to_checkpoint", default=None, type=str)
+    parser.add_argument(
+        "--save_checkpoint",
+        default=None,
+        type=str,
+        required=True,
+        help="Path to save the trained model checkpoint",
+    )
     parser.add_argument("--code_length", default=512, type=int)
     parser.add_argument("--pretrain_text_model_name", default="roberta-base", type=str)
     parser.add_argument(
@@ -178,7 +177,6 @@ def main():
     parser.add_argument("--warmup_steps", default=0, type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--do_train", action="store_true")
 
     args = parser.parse_args()
 
@@ -203,14 +201,8 @@ def main():
     print("Total parameters: ", total_num)
     logger.info("Training parameters: %s", args)
 
-    if args.do_train:
-        train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag="pretrain")
-        if args.from_checkpoint:
-            ckpt_path = os.path.join(args.output_dir, args.from_checkpoint, "model.bin")
-            model.load_state_dict(torch.load(ckpt_path))
-            model.to(args.device)
-            logger.info("Loaded model from %s", ckpt_path)
-        train(args, train_dataset, model, code_tokenizer, text_tokenizer)
+    train_dataset = TrainData(code_tokenizer, text_tokenizer, args, flag="pretrain")
+    train(args, train_dataset, model, code_tokenizer, text_tokenizer)
 
 
 if __name__ == "__main__":

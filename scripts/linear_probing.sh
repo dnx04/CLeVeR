@@ -4,14 +4,19 @@
 # Early stopping on val detection F1. Saves best classifier checkpoint.
 # Evaluates: multi-class (all 91), detection (binary collapse), classification (vulnerable-only).
 #
+# Usage:
+#   Train only:         --to_linprobe_checkpoint <path>
+#   Evaluate only:      --eval_linprobe_checkpoint <path>
+#   Train + Evaluate:    --to_linprobe_checkpoint <path> --eval_linprobe_checkpoint <path>
+#
 set -e
 cd "$(dirname "$0")/.."
 
 PYTHONPATH=src:$PYTHONPATH uv run python src/linear_probing.py \
-    --output_dir=saved_models \
     --dataset=vcldata \
-    --pretrain_checkpoint=pretrain_vul_model \
-    --to_checkpoint=probe_unified \
+    --from_pretrain_checkpoint=saved_models/pretrain_vul_model.bin \
+    --to_linprobe_checkpoint=saved_models/pretrain_vul_model_linprobe.bin \
+    --eval_linprobe_checkpoint=saved_models/pretrain_vul_model_linprobe.bin \
     --pretrain_code_model_name=microsoft/codebert-base \
     --pretrain_text_model_name=roberta-base \
     --code_length 512 \
@@ -24,5 +29,4 @@ PYTHONPATH=src:$PYTHONPATH uv run python src/linear_probing.py \
     --epochs 30 \
     --patience 5 \
     --seed 123456 \
-    --do_train \
-    --do_test 2>&1 | tee "saved_models/linear_probing_unified.log"
+    2>&1 | tee "saved_models/linear_probing_unified.log"

@@ -1,10 +1,10 @@
-from torch.utils.data import Dataset
+import os
 import logging
 import pickle
-import torch
 import json
-from collections import Counter
-import os
+from torch.utils.data import Dataset
+
+from class_def import CWE_LIST, CWE2INT, NUM_CLASSES, DATASET_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -12,52 +12,6 @@ logger = logging.getLogger(__name__)
 def get_dataset_path(dataset_name, split):
     """Returns path to dataset pickle file at dataset/<name>/<name>_<split>.pkl"""
     return f"dataset/{dataset_name}/{dataset_name}_{split}.pkl"
-
-
-# ---------------------------------------------------------------------------
-# Dynamic CWE mapping: built before any Dataset classes to avoid forward refs
-# Only includes CWEs with >= 50 samples in the full dataset
-# ---------------------------------------------------------------------------
-CWE_FREQUENCY_THRESHOLD = 50
-
-
-def _build_cwe_mapping():
-    """
-    Scan all pickle files to find CWEs with >= 50 samples total.
-    Returns (cwe_list, cwe2int) where cwe2int maps CWE string -> 2-based index
-    (0 = safe/None, 1 = vulnerable without a labeled CWE type).
-
-    Class index layout (91 total):
-      0          : safe (cwe_id=None or cwe_id="None", label=0)
-      1          : vulnerable but not CWE-labeled (cwe_id="None", label=1)
-      2 .. 90    : specific CWE types (CWE_LIST[i] -> class i+2)
-    """
-    cwe_counter = Counter()
-    for split in ["pretrain", "train", "val", "test"]:
-        path = f"dataset/vcldata/vcldata_{split}.pkl"
-        if not os.path.exists(path):
-            continue
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        for x in data:
-            if x.cwe_id is not None:
-                cwe_counter[str(x.cwe_id)] += 1
-
-    valid_cwes = sorted(
-        [
-            cwe
-            for cwe, cnt in cwe_counter.items()
-            if cnt >= CWE_FREQUENCY_THRESHOLD and cwe != "None"
-        ]
-    )
-    # CWE index 0 = safe, index 1 = unlabeled vuln, index 2+ = specific CWE
-    cwe2int = {cwe: idx + 2 for idx, cwe in enumerate(valid_cwes)}
-    return valid_cwes, cwe2int
-
-
-CWE_LIST, CWE2INT = _build_cwe_mapping()
-# 91 total: index 0 = safe, index 1 = unlabeled vuln, indices 2-90 = specific CWEs
-NUM_CLASSES = len(CWE_LIST) + 2
 
 
 # ---------------------------------------------------------------------------
@@ -176,88 +130,13 @@ class TrainData(Dataset):
         )
 
 
-class DetectionProbeData(Dataset):
-    """Used for feature extraction. Returns code tokens + binary label (0=safe, 1=vulnerable)."""
-
-    def __init__(self, code_tokenizer, text_tokenizer, args, flag=""):
-        self.examples = _load_examples(args, flag)
-        self.code_tokenizer = code_tokenizer
-        self.text_tokenizer = text_tokenizer
-        self.code_max_length = 512
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, item):
-        func = self.examples[item].func
-        label = int(self.examples[item].label)
-        func_input = self.code_tokenizer(
-            func,
-            max_length=self.code_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return (
-            func_input["input_ids"].squeeze(0),
-            func_input["attention_mask"].squeeze(0),
-            torch.tensor(label),
-        )
-
-
-class ClassificationProbeData(Dataset):
-    """Used for feature extraction. Returns code tokens + unified CWE label.
-
-    Class index layout (91 total):
-      0  : safe (cwe_id=None/"None", label=0)
-      1  : unlabeled vuln (cwe_id="None", label=1)
-      2+ : specific CWE types (cwe_id in CWE2INT)
+class UnifiedData(Dataset):
     """
+    Unified dataset for both zero-shot evaluation and linear probing.
+    - Zero-shot: uses description tokens + cosine similarity
+    - Linear probing: ignores description tokens, uses only code + label
 
-    def __init__(self, code_tokenizer, text_tokenizer, args, flag=""):
-        self.examples = _load_examples(args, flag)
-        self.code_tokenizer = code_tokenizer
-        self.text_tokenizer = text_tokenizer
-        self.code_max_length = 512
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, item):
-        func = self.examples[item].func
-        cwe_id = self.examples[item].cwe_id
-        label = int(self.examples[item].label)
-        cwe_str = str(cwe_id)
-
-        if cwe_str == "None" and label == 1:
-            # Vulnerable but no specific CWE type
-            cwe_label = 1
-        elif is_safe_cwe(cwe_id) or label == 0:
-            # Safe
-            cwe_label = 0
-        else:
-            # Specific CWE type
-            cwe_label = CWE2INT.get(cwe_str, 0)
-
-        func_input = self.code_tokenizer(
-            func,
-            max_length=self.code_max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return (
-            func_input["input_ids"].squeeze(0),
-            func_input["attention_mask"].squeeze(0),
-            torch.tensor(cwe_label),
-        )
-
-
-class UnifiedTestData(Dataset):
-    """
-    Used for zero-shot evaluation. Returns code tokens + all description tokens + unified CWE label.
-
-    Class index layout (91 total):
+    Class index layout (NUM_CLASSES total):
       0  : safe (cwe_id=None/"None", label=0)
       1  : unlabeled vuln (cwe_id="None", label=1)
       2+ : specific CWE types (cwe_id in CWE2INT)
@@ -294,6 +173,7 @@ class UnifiedTestData(Dataset):
             return_tensors="pt",
         )
 
+        # Zero-shot needs all description tokens; linear probing ignores them
         desc_ids_list, desc_mask_list = [], []
         for desc in UNIFIED_DESCS:
             d = self.text_tokenizer(
