@@ -183,7 +183,7 @@ class UnifiedData(Dataset):
         return (
             func_input["input_ids"].squeeze(0),
             func_input["attention_mask"].squeeze(0),
-            desc_ids_list,
-            desc_mask_list,
+            torch.stack(desc_ids_list),
+            torch.stack(desc_mask_list),
             torch.tensor(unified_label),
         )
