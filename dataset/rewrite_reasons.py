@@ -68,6 +68,11 @@ GENERIC_SAFE_REASONS = (
 )
 
 
+def get_field(ex, name, default=""):
+    """Get a field from ExampleFeature (attribute) or dict-like object."""
+    return getattr(ex, name, ex.get(name, default) if hasattr(ex, "get") else default)
+
+
 def is_generic_safe(reason):
     return reason in GENERIC_SAFE_REASONS
 
@@ -179,11 +184,10 @@ def decide_reason(sample, cwe_names, llm_client=None):
     Return (new_reason, source) for the sample.
     source: 'flaw' | 'original' | 'safe_template' | 'llm' | 'failed'
     """
-    func = sample.get("func", "")
-    cwe_id = str(sample.get("cwe_id", "None"))
-    label = str(sample.get("label", "0"))
-    old_reason = sample.get("reason", "")
-
+    func = getattr(sample, "func", "")
+    cwe_id = str(getattr(sample, "cwe_id", "None"))
+    label = str(getattr(sample, "label", "0"))
+    old_reason = getattr(sample, "description", "")
     is_safe = label == "0"
     is_unlabeled = cwe_id == "None" and not is_safe
 
@@ -209,9 +213,9 @@ def decide_reason(sample, cwe_names, llm_client=None):
     cwe_name = cwe_names.get(cwe_id, f"CWE-{cwe_id}") if cwe_id != "None" else "unlabeled"
     prompt = build_llm_prompt(
         cwe_id, cwe_name,
-        sample.get("func", ""),
-        sample.get("source", ""),
-        sample.get("sink", ""),
+        func,
+        getattr(sample, "source", ""),
+        getattr(sample, "sink", ""),
         is_unlabeled,
     )
     result = call_gemma(llm_client, prompt)
@@ -266,21 +270,21 @@ def main():
     changes = []
 
     for ex in tqdm(data, desc="Processing"):
-        old_reason = ex.get("reason", "")
+        old_reason = get_field(ex, "description", "")
         new_reason, source = decide_reason(ex, cwe_names, llm_client=None)
         stats[source] += 1
-        if source not in ("original", "failed") or new_reason != old_reason:
+        if new_reason != old_reason:
             changes.append((old_reason, new_reason, source))
-        ex["_reason_src"] = source
+        setattr(ex, "_reason_src", source)
         if not args.dry_run:
-            ex["reason"] = new_reason
+            setattr(ex, "description", new_reason)
 
     print(f"\nPass 1 stats: { {k: v for k, v in stats.items() if v > 0} }")
 
     # -------------------------------------------------------------------------
     # Pass 2: LLM enhancement for remaining problematic samples
     # -------------------------------------------------------------------------
-    problematic = [ex for ex in data if ex.get("_reason_src") in ("llm", "failed")]
+    problematic = [ex for ex in data if getattr(ex, "_reason_src", None) in ("llm", "failed")]
     if problematic:
         print(f"\nPass 2: LLM enhancement for {len(problematic)} samples...")
         total_calls = 0
@@ -289,23 +293,19 @@ def main():
 
         all_tasks = []
         for ex in problematic:
-            cwe_id = str(ex.get("cwe_id", "None"))
-            is_unlabeled = cwe_id == "None" and int(ex.get("label", 0)) == 1
-            if cwe_id == "None":
-                cwe_name = "unlabeled"
-            else:
-                cwe_name = cwe_names.get(cwe_id, f"CWE-{cwe_id}")
+            cwe_id = str(get_field(ex, "cwe_id", "None"))
+            is_unlabeled = cwe_id == "None" and int(get_field(ex, "label", "0")) == 1
+            cwe_name = cwe_names.get(cwe_id, f"CWE-{cwe_id}") if cwe_id != "None" else "unlabeled"
             all_tasks.append((ex, cwe_name, is_unlabeled, llm_client))
 
         def process_task(task):
             ex, cwe_name, is_unlabeled, client = task
-            old_reason = ex.get("reason", "")
-            cwe_id = str(ex.get("cwe_id", "None"))
-            code = ex.get("func", "")
-            source = ex.get("source", "")
-            sink = ex.get("sink", "")
-
-            prompt = build_llm_prompt(cwe_id, cwe_name, code, source, sink, is_unlabeled)
+            old_reason = get_field(ex, "description", "")
+            cwe_id = str(get_field(ex, "cwe_id", "None"))
+            code = get_field(ex, "func", "")
+            src = get_field(ex, "source", "")
+            sink = get_field(ex, "sink", "")
+            prompt = build_llm_prompt(cwe_id, cwe_name, code, src, sink, is_unlabeled)
             result = call_gemma(client, prompt)
             if result:
                 return old_reason, clean_result(result), "llm"
@@ -325,9 +325,9 @@ def main():
 
                 # Update sample in-place
                 for ex in data:
-                    if ex.get("func") == all_tasks[futures[future]][0].get("func"):
-                        ex["reason"] = new_reason
-                        ex["_reason_src"] = "llm" if status == "llm" else "failed"
+                    if get_field(ex, "func", "") == get_field(all_tasks[futures[future]][0], "func", ""):
+                        setattr(ex, "description", new_reason)
+                        setattr(ex, "_reason_src", "llm" if status == "llm" else "failed")
                         break
 
                 pbar.update(1)
@@ -344,7 +344,8 @@ def main():
     # Clean helper fields
     # -------------------------------------------------------------------------
     for ex in data:
-        ex.pop("_reason_src", None)
+        if hasattr(ex, "_reason_src"):
+            delattr(ex, "_reason_src")
 
     # -------------------------------------------------------------------------
     # Report
