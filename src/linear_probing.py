@@ -104,6 +104,7 @@ def evaluate_unified(classifier, features, labels, device):
     """
     classifier.eval()
     y_preds, y_trues = [], []
+    y_logits = []  # for confidence analysis
 
     dataset = torch.utils.data.TensorDataset(features, labels)
     loader = DataLoader(dataset, batch_size=512)
@@ -114,9 +115,11 @@ def evaluate_unified(classifier, features, labels, device):
             outputs = classifier(feat)
             y_preds.append(outputs.argmax(dim=-1).cpu().numpy())
             y_trues.append(lbl.cpu().numpy())
+            y_logits.append(outputs.cpu().numpy())
 
     y_preds = np.concatenate(y_preds, 0)
     y_trues = np.concatenate(y_trues, 0)
+    y_logits = np.concatenate(y_logits, 0)  # (N, NUM_CLASSES)
 
     from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
 
@@ -177,7 +180,56 @@ def evaluate_unified(classifier, features, labels, device):
     else:
         classification_result = {"num_vulnerable_samples": 0}
 
-    return multiclass_result, detection_result, classification_result
+    # ---------------------------------------------------------------------------
+    # Statistics for loss function improvement
+    # ---------------------------------------------------------------------------
+    from sklearn.metrics import confusion_matrix
+
+    # Per-CWE stats
+    cwe_stats = {}
+    for cwe in set(y_trues):
+        mask = y_trues == cwe
+        if mask.sum() == 0:
+            continue
+        cwe_preds = y_preds[mask]
+        correct = (cwe_preds == cwe).sum()
+        total = mask.sum()
+        cwe_stats[int(cwe)] = {"total": int(total), "correct": int(correct), "acc": correct / total if total > 0 else 0}
+
+    # Most confused CWE pairs
+    conf_matrix = confusion_matrix(y_trues, y_preds, labels=list(range(NUM_CLASSES)))
+    confused_pairs = []
+    for i in range(conf_matrix.shape[0]):
+        for j in range(conf_matrix.shape[1]):
+            if i != j and conf_matrix[i, j] >= 3:
+                confused_pairs.append((i, j, int(conf_matrix[i, j])))
+    confused_pairs.sort(key=lambda x: -x[2])
+
+    # Detection confusion
+    detect_cm = confusion_matrix(detect_trues, detect_preds)
+    tn, fp, fn, tp = detect_cm.ravel() if detect_cm.size == 4 else (0, 0, 0, 0)
+
+    # Top-k accuracy
+    top_k_accs = {}
+    for k in [1, 3, 5]:
+        top_k_correct = 0
+        for idx, true_cwe in enumerate(y_trues):
+            top_k_preds = np.argsort(y_logits[idx])[-k:]
+            if true_cwe in top_k_preds:
+                top_k_correct += 1
+        top_k_accs[k] = top_k_correct / len(y_trues) if len(y_trues) > 0 else 0
+
+    stats_result = {
+        "per_cwe_stats": cwe_stats,
+        "top_confused_pairs": confused_pairs[:20],
+        "detection_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        "top_k_accuracy": {k: round(v, 4) for k, v in top_k_accs.items()},
+        "num_classes": NUM_CLASSES,
+        "num_safe_test": int((y_trues == 0).sum()),
+        "num_vuln_test": int((y_trues != 0).sum()),
+    }
+
+    return multiclass_result, detection_result, classification_result, stats_result
 
 
 def save_classifier(checkpoint_path, classifier):
@@ -246,7 +298,7 @@ def train_with_early_stopping(
             total_loss += loss.item()
 
         avg_loss = round(total_loss / len(train_loader), 5)
-        _, val_detect_results, val_class_results = evaluate_unified(
+        _, val_detect_results, val_class_results, _ = evaluate_unified(
             classifier, val_features, val_labels, device
         )
 
@@ -465,7 +517,7 @@ def main():
         classifier.to(device)
         classifier.eval()
 
-        multiclass_result, detection_result, classification_result = evaluate_unified(
+        multiclass_result, detection_result, classification_result, stats_result = evaluate_unified(
             classifier, test_features, test_labels, device
         )
 
@@ -488,6 +540,19 @@ def main():
         for k, v in classification_result.items():
             logger.info("  %s = %s", k, str(round(v, 4)))
         print("Classification results:", classification_result)
+
+        logger.info("***** Statistics for loss function design *****")
+        logger.info("  Safe test samples: %d, Vulnerable test samples: %d",
+                    stats_result["num_safe_test"], stats_result["num_vuln_test"])
+        logger.info("  Detection TN=%d FP=%d FN=%d TP=%d",
+                    stats_result["detection_cm"]["tn"], stats_result["detection_cm"]["fp"],
+                    stats_result["detection_cm"]["fn"], stats_result["detection_cm"]["tp"])
+        logger.info("  Top-k accuracy: %s", stats_result["top_k_accuracy"])
+        if stats_result["top_confused_pairs"]:
+            logger.info("  Top confused pairs (true->pred, count):")
+            for true_cwe, pred_cwe, count in stats_result["top_confused_pairs"][:10]:
+                logger.info("    CWE-%d -> CWE-%d: %d misclassifications", true_cwe, pred_cwe, count)
+        print("Statistics:", stats_result)
 
     logger.info("Done.")
 

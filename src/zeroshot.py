@@ -121,6 +121,7 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
 
     all_preds = []
     all_trues = []
+    all_sims = []  # for top-k and confidence analysis
 
     for batch in tqdm(test_dataloader, desc="Zero-shot unified"):
         (func_input_ids, func_attention_mask, _, _, label) = [
@@ -145,9 +146,11 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
 
         all_preds.append(preds.cpu().numpy())
         all_trues.append(label.cpu().numpy())
+        all_sims.append(sims.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, 0)
     all_trues = np.concatenate(all_trues, 0)
+    all_sims = np.concatenate(all_sims, 0)  # (N, NUM_CLASSES)
 
     from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
 
@@ -242,6 +245,66 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     for key in sorted(classification_result.keys()):
         logger.info("  %s = %s", key, str(round(classification_result[key], 4)))
 
+    # ---------------------------------------------------------------------------
+    # Statistics for loss function improvement
+    # ---------------------------------------------------------------------------
+    from sklearn.metrics import confusion_matrix
+
+    # Per-CWE stats (for loss function design: which classes need more attention)
+    cwe_stats = {}
+    for cwe in set(all_trues):
+        mask = all_trues == cwe
+        if mask.sum() == 0:
+            continue
+        cwe_preds = all_preds[mask]
+        correct = (cwe_preds == cwe).sum()
+        total = mask.sum()
+        cwe_stats[int(cwe)] = {"total": int(total), "correct": int(correct), "acc": correct / total if total > 0 else 0}
+
+    # Most confused CWE pairs (for pairwise loss / curriculum learning)
+    conf_matrix = confusion_matrix(all_trues, all_preds, labels=list(range(NUM_CLASSES)))
+    confused_pairs = []
+    for i in range(conf_matrix.shape[0]):
+        for j in range(conf_matrix.shape[1]):
+            if i != j and conf_matrix[i, j] >= 3:
+                confused_pairs.append((i, j, int(conf_matrix[i, j])))
+    confused_pairs.sort(key=lambda x: -x[2])
+
+    # Detection confusion (safe vs vulnerable)
+    detect_cm = confusion_matrix(detect_trues, detect_preds)
+    tn, fp, fn, tp = detect_cm.ravel() if detect_cm.size == 4 else (0, 0, 0, 0)
+
+    # Top-k accuracy (for confidence-based loss weighting)
+    top_k_accs = {}
+    for k in [1, 3, 5]:
+        top_k_correct = 0
+        top_k_total = 0
+        for idx, true_cwe in enumerate(all_trues):
+            top_k_preds = np.argsort(all_sims[idx])[-k:]
+            if true_cwe in top_k_preds:
+                top_k_correct += 1
+            top_k_total += 1
+        top_k_accs[k] = top_k_correct / top_k_total if top_k_total > 0 else 0
+
+    stats_result = {
+        "per_cwe_stats": cwe_stats,
+        "top_confused_pairs": confused_pairs[:20],
+        "detection_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        "top_k_accuracy": {k: round(v, 4) for k, v in top_k_accs.items()},
+        "num_classes": NUM_CLASSES,
+        "num_safe_test": int((all_trues == 0).sum()),
+        "num_vuln_test": int((all_trues != 0).sum()),
+    }
+
+    logger.info("***** Statistics for loss function design *****")
+    logger.info("  Safe test samples: %d, Vulnerable test samples: %d", stats_result["num_safe_test"], stats_result["num_vuln_test"])
+    logger.info("  Detection TN=%d FP=%d FN=%d TP=%d", tn, fp, fn, tp)
+    if confused_pairs:
+        logger.info("  Top confused pairs (true->pred, count):")
+        for true_cwe, pred_cwe, count in confused_pairs[:10]:
+            logger.info("    CWE-%d -> CWE-%d: %d misclassifications", true_cwe, pred_cwe, count)
+    print("Statistics:", stats_result)
+
     # Always print all results (unified evaluation gives all metrics at once)
     print("Multiclass results:", multiclass_result)
     print("Detection results:", detection_result)
@@ -251,6 +314,7 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
         "multiclass": multiclass_result,
         "detection": detection_result,
         "classification": classification_result,
+        "stats": stats_result,
     }
 
 
