@@ -285,8 +285,9 @@ def main():
     # Pass 2: LLM enhancement for remaining problematic samples
     # -------------------------------------------------------------------------
     problematic = [ex for ex in data if getattr(ex, "_reason_src", None) in ("llm", "failed")]
-    if problematic:
-        print(f"\nPass 2: LLM enhancement for {len(problematic)} samples...")
+    if args.no_llm or not problematic:
+        print("\nNo samples need LLM enhancement.")
+    else:
         total_calls = 0
         llm_success = 0
         llm_fail = 0
@@ -337,8 +338,6 @@ def main():
             pbar.close()
 
         print(f"\nLLM stats: success={llm_success}, failed={llm_fail}")
-    else:
-        print("\nNo samples need LLM enhancement.")
 
     # -------------------------------------------------------------------------
     # Clean helper fields
