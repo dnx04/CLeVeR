@@ -29,13 +29,18 @@ import os
 import time
 import json
 import argparse
-import threading
+import sys
 from tqdm import tqdm
 from openai import OpenAI
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv(".env.local")
+
+# Ensure src/ is on path so pickle can find ExampleFeature class
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
 API_KEY = os.environ.get("FPTAI_API_KEY", "")
 BASE_URL = "https://mkp-api.fptcloud.com/v1"
