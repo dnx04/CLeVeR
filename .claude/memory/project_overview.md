@@ -11,7 +11,7 @@ lastUpdated: 2026-04-17
 ## Paper
 **CLeVeR: Multi-modal Contrastive Learning for Vulnerability Code Representation**
 - Published: ACL 2025 Findings
-- GitHub: https://github.com/yaimiya-nlp/CLeVeR
+- GitHub: https://github.com/yoimiya-nlp/CLeVeR
 
 ## Key Results (from paper)
 | Dataset | Task | F1 |
