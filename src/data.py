@@ -2,6 +2,7 @@ import os
 import logging
 import pickle
 import json
+import torch
 from torch.utils.data import Dataset
 
 from class_def import CWE_LIST, CWE2INT, NUM_CLASSES, DATASET_NAME
