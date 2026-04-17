@@ -2,10 +2,13 @@
 Unified reason enhancement for vcldata.pkl.
 
 Priority order for reason sources:
-  1. FLAW comment in code           → use directly
-  2. Non-generic existing reason    → keep original
-  3. Generic safe (label=0)        → safe description template
-  4. Generic vuln (label=1)        → LLM enhance via Gemma 4
+  1. FLAW comment in code (VULN only)  → use directly
+  2. Non-generic existing reason        → keep original
+  3. Generic safe (label=0)           → safe description template
+  4. Generic vuln (label=1)            → LLM enhance via Gemma 4
+
+IMPORTANT: FLAW comments on SAFE samples describe the BAD counterpart's vulnerability,
+           NOT the current safe function — so FLAW is only used for VULN samples.
 
 Priority for FLAW markers (highest to lowest):
   1. FLAW:           (confirmed vuln)
@@ -14,10 +17,6 @@ Priority for FLAW markers (highest to lowest):
   4. INCIDENTAL FLAW: (incidental/lesser issue)
 
 FIX: and INCIDENTAL: are skipped (not vulnerability descriptions).
-
-Samples flagged for LLM enhancement:
-  - Specific CWE with generic "may cause a CWE-X" pattern
-  - Unlabeled vuln (cwe_id="None") with generic "may cause a None" pattern
 
 Usage:
     uv run python dataset/rewrite_reasons.py [--dry-run] [--no-llm]
@@ -191,22 +190,27 @@ def decide_reason(sample, cwe_names, llm_client=None):
     is_safe = label == "0"
     is_unlabeled = cwe_id == "None" and not is_safe
 
-    # 1. FLAW comment → use directly
+    # 1. FLAW comment → use directly (VULN samples only)
+    # NOTE: FLAW on SAFE describes the bad counterpart's vuln, NOT the safe function itself
     flaw = extract_flaw(func)
-    if flaw:
+    if flaw and not is_safe:
         return flaw, "flaw"
 
-    # 2. Safe samples with generic reason → safe template
+    # 2. Safe samples: FLAW skipped, apply generic → template
     if is_safe:
         if is_generic_safe(old_reason):
             return "This is a secure function with no vulnerability.", "safe_template"
         return old_reason, "original"
 
-    # 3. Vuln samples — keep non-generic reasons
+    # 3. Vuln samples: FLAW available → use it
+    if flaw:
+        return flaw, "flaw"
+
+    # 4. Vuln samples — keep non-generic reasons
     if not is_generic_vuln(old_reason):
         return old_reason, "original"
 
-    # 4. Vuln samples with generic reasons → LLM enhance (if client provided)
+    # 5. Vuln samples with generic reasons → LLM enhance (if client provided)
     if llm_client is None:
         return old_reason, "failed"
 
