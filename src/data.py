@@ -33,12 +33,9 @@ def get_cwe_description(cwe_id):
     return f"A vulnerability of CWE-{cwe_id}."
 
 
-# Unified description list for zero-shot: index 0 = safe, index 1+ = CWE types
-SAFE_DESCRIPTION = "This is a secure function with no vulnerability."
-UNIFIED_DESCS = (
-    [SAFE_DESCRIPTION]
-    + [get_cwe_description(cwe) for cwe in CWE_LIST]
-)
+# Unified description list for zero-shot: CWE type descriptions only (no safe class)
+# Prediction: if max_sim < threshold -> safe (label 0), else -> CWE type
+UNIFIED_DESCS = [get_cwe_description(cwe) for cwe in CWE_LIST]
 
 
 def _load_examples(args, flag):
@@ -154,10 +151,12 @@ class UnifiedData(Dataset):
         label = int(self.examples[item].label)
         cwe_str = str(cwe_id)
 
+        # Safe samples: label = -1 (not a CWE class)
+        # CWE samples: label = CWE2INT[cwe_str] (0-97, where 0=CWE_LIST[0]=CWE-114)
         if is_safe_cwe(cwe_id) or label == 0:
-            unified_label = 0
+            unified_label = -1  # special marker for safe (not a CWE class)
         else:
-            unified_label = CWE2INT.get(cwe_str, 0)
+            unified_label = CWE2INT.get(cwe_str, -1)  # -1 if unknown CWE
 
         func_input = self.code_tokenizer(
             func,

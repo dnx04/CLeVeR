@@ -36,11 +36,11 @@ from data import UNIFIED_DESCS, CWE_LIST, CWE2INT, NUM_CLASSES
 
 def pre_encode_descriptions(model, text_tokenizer, device, max_length=64):
     """
-    Pre-encode all unified description texts through the description encoder + adapter.
-    Returns a tensor of shape (NUM_CLASSES, hidden) — 1 safe + len(CWE_LIST) CWE types.
+    Pre-encode all CWE description texts through the description encoder + adapter.
+    Returns a tensor of shape (98, hidden) — one per CWE type (no safe class).
     """
     inputs = text_tokenizer(
-        UNIFIED_DESCS,
+        UNIFIED_DESCS,  # 98 CWE descriptions only
         max_length=max_length,
         padding="max_length",
         truncation=True,
@@ -54,12 +54,12 @@ def pre_encode_descriptions(model, text_tokenizer, device, max_length=64):
         outputs = model.desc_encoder.encoder(
             input_ids=input_ids, attention_mask=attention_mask
         )
-        cls_tokens = outputs.last_hidden_state[:, 0, :]  # (NUM_CLASSES, hidden)
+        cls_tokens = outputs.last_hidden_state[:, 0, :]  # (98, hidden)
         desc_embeddings = model.desc_encoder.description_adapter(
             cls_tokens
-        )  # (NUM_CLASSES, hidden)
+        )  # (98, hidden)
 
-    return desc_embeddings  # (NUM_CLASSES, hidden)
+    return desc_embeddings  # (98, hidden)
 
 
 def encode_code(model, func_input_ids, func_attention_mask, device):
@@ -82,27 +82,29 @@ def encode_code(model, func_input_ids, func_attention_mask, device):
 
 def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     """
-    Unified zero-shot evaluation: single 90-class prediction per sample (0=safe, 1-89=CWE types).
+    Unified zero-shot evaluation: 98 CWE classes (no safe class in similarity computation).
 
-    Pre-computes all NUM_CLASSES description embeddings once.
-    For each sample: encode code once, compute cosine similarity against all descriptions.
-    Prediction = argmax over all classes.
+    Pre-computes all 98 CWE description embeddings once.
+    For each sample: encode code once, compute cosine similarity against all CWE descriptions.
+    Prediction:
+      - If max_sim < threshold -> predict safe (class 0)
+      - Else -> argmax CWE class (1-98)
 
     Metrics derived:
-      - Unified F1: standard multi-class F1 over all 90 classes
+      - Unified F1: standard multi-class F1 over all 99 classes (0 + 98 CWE)
       - Detection F1: binary F1 (collapse to safe=0, vulnerable=1)
       - Classification F1: CWE-type F1 only on vulnerable ground-truth samples
     """
     from data import UnifiedData
 
     # ---------------------------------------------------------------------------
-    # 1. Pre-encode all unified description embeddings (done once)
+    # 1. Pre-encode all CWE description embeddings (98 classes, done once)
     # ---------------------------------------------------------------------------
     all_desc_embeddings = pre_encode_descriptions(model, text_tokenizer, args.device)
-    # all_desc_embeddings shape: (NUM_CLASSES, hidden)
+    # all_desc_embeddings shape: (98, hidden)
 
     # ---------------------------------------------------------------------------
-    # 2. Load test data using UnifiedData (unified CWE label: 0=safe, 1-90=CWE)
+    # 2. Load test data using UnifiedData (labels: 0=safe, 1-98=CWE types)
     # ---------------------------------------------------------------------------
     test_dataset = UnifiedData(code_tokenizer, text_tokenizer, args, flag=flag)
     test_sampler = SequentialSampler(test_dataset)
@@ -141,8 +143,22 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
             dim=-1,  # reduce over hidden dim
         )  # shape: (batch, NUM_CLASSES)
 
-        # Unified prediction: argmax over all classes
-        preds = sims.argmax(dim=-1)  # (batch,) — class index 0-90
+        # Unified prediction: argmax over all CWE classes (98 classes, no safe class)
+        # Class index 0 = CWE_LIST[0] = CWE-114, ..., class index 97 = CWE_LIST[97] = CWE-789
+        max_sims, argmax_idx = sims.max(dim=-1)  # (batch,), (batch,)
+
+        # Apply confidence threshold if specified
+        if args.confidence_threshold is not None:
+            # If max similarity < threshold, predict safe (-1)
+            # Otherwise, argmax_idx (0-97) -> CWE class (0-97)
+            preds = torch.where(
+                max_sims < args.confidence_threshold,
+                torch.full_like(argmax_idx, -1),  # predict safe (-1)
+                argmax_idx  # predict CWE class (0-97)
+            )
+        else:
+            # No threshold: predict CWE class directly
+            preds = argmax_idx  # class indices 0-97
 
         all_preds.append(preds.cpu().numpy())
         all_trues.append(label.cpu().numpy())
@@ -155,35 +171,38 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
 
     # ---------------------------------------------------------------------------
-    # Metric 1: Multi-class F1 over all 91 classes (macro and weighted)
+    # Metric 1: Multiclass F1 — only on vulnerable ground-truth samples (0-97)
+    # Safe samples (ground truth = -1) are excluded from multiclass evaluation.
     # ---------------------------------------------------------------------------
-    multiclass_result = {
-        "accuracy": accuracy_score(all_trues, all_preds),
-        "recall_macro": recall_score(
-            all_trues, all_preds, average="macro", zero_division=0
-        ),
-        "precision_macro": precision_score(
-            all_trues, all_preds, average="macro", zero_division=0
-        ),
-        "f1_macro": f1_score(all_trues, all_preds, average="macro", zero_division=0),
-        "recall_weighted": recall_score(
-            all_trues, all_preds, average="weighted", zero_division=0
-        ),
-        "precision_weighted": precision_score(
-            all_trues, all_preds, average="weighted", zero_division=0
-        ),
-        "f1_weighted": f1_score(
-            all_trues, all_preds, average="weighted", zero_division=0
-        ),
-    }
+    vuln_mask = all_trues >= 0  # only vulnerable ground-truth samples (0-97)
+    if vuln_mask.sum() > 0:
+        multiclass_result = {
+            "accuracy": accuracy_score(all_trues[vuln_mask], all_preds[vuln_mask]),
+            "recall_macro": recall_score(
+                all_trues[vuln_mask], all_preds[vuln_mask], average="macro", zero_division=0
+            ),
+            "precision_macro": precision_score(
+                all_trues[vuln_mask], all_preds[vuln_mask], average="macro", zero_division=0
+            ),
+            "f1_macro": f1_score(all_trues[vuln_mask], all_preds[vuln_mask], average="macro", zero_division=0),
+            "recall_weighted": recall_score(
+                all_trues[vuln_mask], all_preds[vuln_mask], average="weighted", zero_division=0
+            ),
+            "precision_weighted": precision_score(
+                all_trues[vuln_mask], all_preds[vuln_mask], average="weighted", zero_division=0
+            ),
+            "f1_weighted": f1_score(
+                all_trues[vuln_mask], all_preds[vuln_mask], average="weighted", zero_division=0
+            ),
+        }
+    else:
+        multiclass_result = {"accuracy": 0, "f1_macro": 0, "f1_weighted": 0}
 
     # ---------------------------------------------------------------------------
-    # Metric 2: Detection F1 — collapse to binary (safe=0 vs vulnerable=1)
+    # Metric 2: Detection F1 — collapse to binary (safe=-1 vs vulnerable=0-97)
     # ---------------------------------------------------------------------------
-    detect_trues = (all_trues != 0).astype(int)  # 0 if safe, 1 if vulnerable
-    detect_preds = (all_preds != 0).astype(
-        int
-    )  # 0 if predicted safe, 1 if predicted CWE
+    detect_trues = (all_trues >= 0).astype(int)  # 0 if safe (-1), 1 if vulnerable (0-97)
+    detect_preds = (all_preds >= 0).astype(int)  # 0 if predicted safe (-1), 1 if predicted CWE
     detection_result = {
         "accuracy": accuracy_score(detect_trues, detect_preds),
         "recall": recall_score(detect_trues, detect_preds),
@@ -193,11 +212,9 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
 
     # ---------------------------------------------------------------------------
     # Metric 3: Classification F1 — only on vulnerable ground-truth samples
-    # Ground-truth safe samples (label=0) are excluded.
-    # A correct prediction requires: both truth AND prediction are CWE types
-    # (not None/safe), and the CWE type matches.
+    # A correct prediction requires: both truth AND prediction are CWE types (>=0)
     # ---------------------------------------------------------------------------
-    vuln_mask = all_trues != 0  # only vulnerable ground-truth samples
+    vuln_mask = all_trues >= 0  # only vulnerable ground-truth samples
     if vuln_mask.sum() > 0:
         classification_result = {
             "accuracy": accuracy_score(all_trues[vuln_mask], all_preds[vuln_mask]),
@@ -233,7 +250,7 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
         int(vuln_mask.sum()),
     )
 
-    logger.info("***** Multi-class results (all %d classes) *****", NUM_CLASSES)
+    logger.info("***** CWE classification results (%d classes, vulnerable-only) *****", NUM_CLASSES)
     for key in sorted(multiclass_result.keys()):
         logger.info("  %s = %s", key, str(round(multiclass_result[key], 4)))
 
@@ -250,9 +267,9 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
     # ---------------------------------------------------------------------------
     from sklearn.metrics import confusion_matrix
 
-    # Per-CWE stats (for loss function design: which classes need more attention)
+    # Per-CWE stats (only vulnerable samples with ground truth >= 0)
     cwe_stats = {}
-    for cwe in set(all_trues):
+    for cwe in set(all_trues[all_trues >= 0]):
         mask = all_trues == cwe
         if mask.sum() == 0:
             continue
@@ -262,24 +279,31 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
         cwe_stats[int(cwe)] = {"total": int(total), "correct": int(correct), "acc": correct / total if total > 0 else 0}
 
     # Most confused CWE pairs (for pairwise loss / curriculum learning)
-    conf_matrix = confusion_matrix(all_trues, all_preds, labels=list(range(NUM_CLASSES)))
-    confused_pairs = []
-    for i in range(conf_matrix.shape[0]):
-        for j in range(conf_matrix.shape[1]):
-            if i != j and conf_matrix[i, j] >= 3:
-                confused_pairs.append((i, j, int(conf_matrix[i, j])))
-    confused_pairs.sort(key=lambda x: -x[2])
+    # Only include vulnerable samples (truth >= 0 and pred >= 0)
+    conf_mask = (all_trues >= 0) & (all_preds >= 0)
+    if conf_mask.sum() > 0:
+        conf_matrix = confusion_matrix(all_trues[conf_mask], all_preds[conf_mask], labels=list(range(NUM_CLASSES)))
+        confused_pairs = []
+        for i in range(conf_matrix.shape[0]):
+            for j in range(conf_matrix.shape[1]):
+                if i != j and conf_matrix[i, j] >= 3:
+                    confused_pairs.append((i, j, int(conf_matrix[i, j])))
+        confused_pairs.sort(key=lambda x: -x[2])
+    else:
+        confused_pairs = []
 
     # Detection confusion (safe vs vulnerable)
     detect_cm = confusion_matrix(detect_trues, detect_preds)
     tn, fp, fn, tp = detect_cm.ravel() if detect_cm.size == 4 else (0, 0, 0, 0)
 
-    # Top-k accuracy (for confidence-based loss weighting)
+    # Top-k accuracy (only on vulnerable samples)
     top_k_accs = {}
     for k in [1, 3, 5]:
         top_k_correct = 0
         top_k_total = 0
         for idx, true_cwe in enumerate(all_trues):
+            if true_cwe < 0:  # skip safe samples
+                continue
             top_k_preds = np.argsort(all_sims[idx])[-k:]
             if true_cwe in top_k_preds:
                 top_k_correct += 1
@@ -292,17 +316,23 @@ def evaluate_both(args, model, code_tokenizer, text_tokenizer, flag="test"):
         "detection_cm": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
         "top_k_accuracy": {k: round(v, 4) for k, v in top_k_accs.items()},
         "num_classes": NUM_CLASSES,
-        "num_safe_test": int((all_trues == 0).sum()),
-        "num_vuln_test": int((all_trues != 0).sum()),
+        "num_safe_test": int((all_trues < 0).sum()),
+        "num_vuln_test": int((all_trues >= 0).sum()),
     }
+
+    def _cwe_name(idx):
+        """Resolve class index (0-97) to CWE label string."""
+        if idx < 0:
+            return "safe"
+        return f"CWE-{CWE_LIST[idx]}"  # index 0-97 maps directly to CWE_LIST[idx]
 
     logger.info("***** Statistics for loss function design *****")
     logger.info("  Safe test samples: %d, Vulnerable test samples: %d", stats_result["num_safe_test"], stats_result["num_vuln_test"])
     logger.info("  Detection TN=%d FP=%d FN=%d TP=%d", tn, fp, fn, tp)
     if confused_pairs:
         logger.info("  Top confused pairs (true->pred, count):")
-        for true_cwe, pred_cwe, count in confused_pairs[:10]:
-            logger.info("    CWE-%d -> CWE-%d: %d misclassifications", true_cwe, pred_cwe, count)
+        for true_idx, pred_idx, count in confused_pairs[:10]:
+            logger.info("    %s -> %s: %d misclassifications", _cwe_name(true_idx), _cwe_name(pred_idx), count)
     print("Statistics:", stats_result)
 
     # Always print all results (unified evaluation gives all metrics at once)
@@ -338,6 +368,12 @@ def main():
     parser.add_argument("--eval_batch_size", default=256, type=int)
     parser.add_argument("--num_workers", default=8, type=int)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--confidence_threshold",
+        type=float,
+        default=None,
+        help="Static threshold for confidence. If max similarity < threshold, predict safe (class 0). Default: None (use argmax)",
+    )
 
     args = parser.parse_args()
 

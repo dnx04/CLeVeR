@@ -548,10 +548,14 @@ def main():
                     stats_result["detection_cm"]["tn"], stats_result["detection_cm"]["fp"],
                     stats_result["detection_cm"]["fn"], stats_result["detection_cm"]["tp"])
         logger.info("  Top-k accuracy: %s", stats_result["top_k_accuracy"])
+        def _cwe_name(idx):
+            if idx == 0:
+                return "safe"
+            return f"CWE-{CWE_LIST[idx - 1]}"
         if stats_result["top_confused_pairs"]:
             logger.info("  Top confused pairs (true->pred, count):")
-            for true_cwe, pred_cwe, count in stats_result["top_confused_pairs"][:10]:
-                logger.info("    CWE-%d -> CWE-%d: %d misclassifications", true_cwe, pred_cwe, count)
+            for true_idx, pred_idx, count in stats_result["top_confused_pairs"][:10]:
+                logger.info("    %s -> %s: %d misclassifications", _cwe_name(true_idx), _cwe_name(pred_idx), count)
         print("Statistics:", stats_result)
 
     logger.info("Done.")
